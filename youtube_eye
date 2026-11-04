@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# YouTube PLAYER on-screen captions → cc_injector (what your eyes see).
+set -euo pipefail
+cd "$(dirname "$0")"
+ROOT="$(pwd)"
+PY="${ROOT}/.venv/bin/python"
+if [[ ! -x "$PY" ]]; then
+  echo "[yt-eye] creating venv + playwright…" >&2
+  python3 -m venv .venv
+  .venv/bin/pip install -q playwright
+  .venv/bin/playwright install chromium
+fi
+exec "$PY" "${ROOT}/youtube_player_cc.py" "$@"

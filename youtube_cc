@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# youtube_cc — live YouTube captions → local injector (+ web monitor)
+#   ./youtube_cc
+#   ./youtube_cc 'https://www.youtube.com/watch?v=gCNeDWCI0vo'
+#   ./youtube_cc --lang en --poll 2
+set -euo pipefail
+cd "$(dirname "$0")"
+
+CONFIG="${CC_CONFIG:-./config.json}"
+URL=""
+PASS=()
+
+if [[ "${1-}" == http* || "${1-}" == www.* || "${1-}" == youtu* ]]; then
+  URL="$1"
+  shift
+fi
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --config|-c) CONFIG="$2"; shift 2 ;;
+    --config=*) CONFIG="${1#*=}"; shift ;;
+    --url) URL="$2"; shift 2 ;;
+    --url=*) URL="${1#*=}"; shift ;;
+    *) PASS+=("$1"); shift ;;
+  esac
+done
+export CC_CONFIG="$CONFIG"
+
+# Stop RSS demo so only YouTube feeds captions (keep injector)
+pkill -f 'python3 ./demo.py' 2>/dev/null || true
+pkill -f 'youtube_live_cc.py' 2>/dev/null || true
+sleep 0.4
+
+if ! pgrep -x cc_injector >/dev/null 2>&1; then
+  echo "[yt] starting injector from config…" >&2
+  ./start_injector.sh "$CONFIG" >>/tmp/cc_injector.log 2>&1 &
+  sleep 2
+fi
+
+EXTRA=()
+[[ -n "$URL" ]] && EXTRA+=(--url "$URL")
+
+exec python3 ./youtube_live_cc.py --config "$CONFIG" "${EXTRA[@]}" "${PASS[@]+"${PASS[@]}"}"

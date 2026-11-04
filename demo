@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+# demo — read config.json, start injector (optional), stream internet captions + web UI
+#
+#   ./demo
+#   ./demo --config ./config.json
+#   ./demo --rows 3 --timeout-ms 5000          # CLI overrides JSON
+#   CC_CONFIG=/path/config.json ./demo
+set -euo pipefail
+cd "$(dirname "$0")"
+
+CONFIG="${CC_CONFIG:-./config.json}"
+HOST=""
+PORT=""
+PASS=()
+
+# Optional positional host / port
+if [[ "${1-}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ || "${1-}" == "localhost" ]]; then
+  HOST="$1"
+  shift
+  if [[ "${1-}" =~ ^[0-9]+$ ]]; then
+    PORT="$1"
+    shift
+  fi
+fi
+
+# Pull --config early
+ARGS=("$@")
+SET_ARGS=()
+i=0
+while [[ $i -lt ${#ARGS[@]} ]]; do
+  a="${ARGS[$i]}"
+  if [[ "$a" == "--config" || "$a" == "-c" ]]; then
+    i=$((i + 1))
+    CONFIG="${ARGS[$i]}"
+  elif [[ "$a" == --config=* ]]; then
+    CONFIG="${a#*=}"
+  else
+    SET_ARGS+=("$a")
+  fi
+  i=$((i + 1))
+done
+set -- "${SET_ARGS[@]+"${SET_ARGS[@]}"}"
+export CC_CONFIG="$CONFIG"
+
+if [[ ! -f "$CONFIG" ]]; then
+  echo "[demo] config not found: $CONFIG" >&2
+  exit 1
+fi
+
+pkill -f 'send_cc_random.sh' 2>/dev/null || true
+pkill -f 'send_random_captions.sh' 2>/dev/null || true
+
+json_get() { python3 ./cc_config.py "$CONFIG" --env "$1"; }
+dotted() { python3 ./cc_config.py "$CONFIG" "$1"; }
+
+# Defaults from JSON (CLI flags later override via demo.py)
+HOST="${HOST:-$(json_get DEMO_HOST)}"
+PORT="${PORT:-$(json_get DEMO_PORT)}"
+APPLY_INJECTOR="$(json_get APPLY_INJECTOR)"
+
+# Allow --no-injector in remaining args
+PASS=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --no-injector) APPLY_INJECTOR=0; shift ;;
+    *) PASS+=("$1"); shift ;;
+  esac
+done
+
+echo "[demo] config: $CONFIG" >&2
+
+if [[ "$HOST" == "127.0.0.1" || "$HOST" == "localhost" ]] && [[ "$APPLY_INJECTOR" == "1" ]]; then
+  chmod +x ./start_injector.sh
+  echo "[demo] starting injector from config…" >&2
+  pkill -x cc_injector 2>/dev/null || true
+  sleep 0.4
+  ./start_injector.sh "$CONFIG" >>/tmp/cc_injector.log 2>&1 &
+  for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do
+    pgrep -x cc_injector >/dev/null 2>&1 && break
+    sleep 0.4
+  done
+  if ! pgrep -x cc_injector >/dev/null 2>&1; then
+    echo "[demo] warning: cc_injector failed — see /tmp/cc_injector.log" >&2
+  fi
+elif ! pgrep -x cc_injector >/dev/null 2>&1; then
+  echo "[demo] warning: cc_injector not running" >&2
+fi
+
+WEB_PORT="$(json_get DEMO_WEB_PORT)"
+IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
+echo "[demo] web: http://${IP:-127.0.0.1}:${WEB_PORT}/" >&2
+echo "[demo] edit $CONFIG then re-run ./demo to apply" >&2
+
+exec python3 ./demo.py --config "$CONFIG" "$HOST" "$PORT" "${PASS[@]+"${PASS[@]}"}"

@@ -1,0 +1,213 @@
+{
+  "_about": "CC_608 live caption configuration. Edit values below, then run ./demo (or ./start_injector.sh). Keys starting with '_' are documentation only and are ignored by the loader. CLI flags and environment variables override this file when provided.",
+  "stream": {
+    "_about": "MPEG-TS video path. Injector reads INPUT, writes OUTPUT with captions embedded (H.264 A/53 SEI).",
+    "input": {
+      "_description": "Source MPEG-TS URL or file. Use UDP multicast/unicast. localaddr must be this machine's NIC IP for multicast.",
+      "value": "udp://239.195.1.17:4900?localaddr=192.168.1.20&reuse=1&fifo_size=120000&buffer_size=65536&overrun_nonfatal=1&timeout=5000000"
+    },
+    "output": {
+      "_description": "Destination MPEG-TS URL or file. Viewers tune this address (e.g. VLC udp://@239.195.11.11:4900) and enable CC1 / DTVCC.",
+      "value": "udp://239.195.11.11:4900?pkt_size=1316&ttl=16&localaddr=192.168.1.20"
+    },
+    "caption_udp": {
+      "_description": "Where the injector listens for caption text (plain ASCII UDP lines). 0.0.0.0 accepts LAN senders. demo/live_type/HTTP gateway send here.",
+      "value": "0.0.0.0:54001"
+    }
+  },
+  "captions": {
+    "_about": "On-screen caption look and behaviour (passed to cc_injector).",
+    "rows": {
+      "_description": "Max roll-up window (2..4). Senders use 1–2 lines normally; a 3rd only when the sentence needs more room.",
+      "value": 3,
+      "_allowed": [
+        2,
+        3,
+        4
+      ]
+    },
+    "row": {
+      "_description": "Vertical screen location (CEA-608 base PAC row). 1 = top, 15 = bottom. Multi-line windows grow upward from this row.",
+      "value": 13,
+      "_allowed": "1..15"
+    },
+    "width": {
+      "_description": "Max characters per line. CEA-608 hard limit is 32 (YouTube-compatible broadcast width). Longer YouTube overlay lines are word-wrapped to this width (full words kept, not mid-word cut).",
+      "value": 32,
+      "_allowed": "8..32"
+    },
+    "timeout_ms": {
+      "_description": "Auto-CLEAR idle timeout in milliseconds. After the last caption is sent, wait this long with no new text then erase captions. 0 = never auto-clear.",
+      "value": 12000,
+      "_allowed": "0 = off, typical 3000..10000"
+    },
+    "color": {
+      "_description": "Foreground text color (608 + mapped into 708).",
+      "value": "yellow",
+      "_allowed": [
+        "white",
+        "green",
+        "blue",
+        "cyan",
+        "red",
+        "yellow",
+        "magenta"
+      ]
+    },
+    "cc": {
+      "_description": "Caption standard to embed. 608 = classic CC1. 708 = DTVCC Service 1 (supports font/pen size). both = 608+708.",
+      "value": "both",
+      "_allowed": [
+        "608",
+        "708",
+        "both"
+      ]
+    },
+    "font": {
+      "_description": "CEA-708 font style (ignored if cc=608). 0=default is the most compatible across VLC/TVs; 1=mono 2=prop 3=mono_sans 4=casual 5=cursive 6=small_caps 7=prop_sans.",
+      "value": 0,
+      "_allowed": "0..7"
+    },
+    "pen_size": {
+      "_description": "CEA-708 pen / font size (ignored if cc=608). standard is the most compatible; large can clip on some players.",
+      "value": "standard",
+      "_allowed": [
+        "small",
+        "standard",
+        "large"
+      ]
+    },
+    "bootstrap": {
+      "_description": "If 1, inject a short 'CC ONLINE' caption at start so players expose the CC track quickly.",
+      "value": 0,
+      "_allowed": [
+        0,
+        1
+      ]
+    },
+    "sei_every": {
+      "_description": "Re-insert null CC keep-alive SEI every N video packets while a caption is showing. Higher = less CPU / less risk of flicker. Typical 8..15.",
+      "value": 15
+    },
+    "clear_frames": {
+      "_description": "How many packets to repeat CLEAR (EDM+row DER) so decoders latch. Typical 4..8 (VLC needs more than 2).",
+      "value": 6
+    }
+  },
+  "demo": {
+    "_about": "Internet caption demo (./demo). Fetches headlines/text and sends them to caption_udp.",
+    "host": {
+      "_description": "Injector host to send UDP captions to. Use 127.0.0.1 when demo runs on the same machine.",
+      "value": "127.0.0.1"
+    },
+    "port": {
+      "_description": "Injector caption UDP port (must match stream.caption_udp port).",
+      "value": 54001
+    },
+    "sources": {
+      "_description": "List of internet sources. Each URL is auto-detected as RSS/Atom, JSON, or plain text. Override with --source on CLI.",
+      "value": [
+        "https://feeds.bbci.co.uk/news/rss.xml",
+        "https://feeds.bbci.co.uk/news/world/rss.xml",
+        "https://rss.nytimes.com/services/xml/rss/nyt/HomePage.xml"
+      ]
+    },
+    "source_type": {
+      "_description": "Force source parser, or auto-detect from Content-Type / body.",
+      "value": "auto",
+      "_allowed": [
+        "auto",
+        "rss",
+        "atom",
+        "json",
+        "text"
+      ]
+    },
+    "json_key": {
+      "_description": "When source_type is json, field name to collect as caption text (searched recursively).",
+      "value": "title"
+    },
+    "every": {
+      "_description": "Seconds to hold each wrapped caption line on air before the next line.",
+      "value": 1.0
+    },
+    "cps": {
+      "_description": "Typing speed in characters per second. 0 = send whole line at once (recommended).",
+      "value": 0.0
+    },
+    "limit": {
+      "_description": "Max items to take from each source fetch.",
+      "value": 40
+    },
+    "refresh": {
+      "_description": "After one full pass of headlines, wait this many seconds then refetch sources.",
+      "value": 60.0
+    },
+    "uppercase": {
+      "_description": "If true, force captions to UPPER CASE (classic TV look).",
+      "value": true
+    },
+    "apply_injector": {
+      "_description": "If true, ./demo restarts local cc_injector using stream+captions from this file before sending.",
+      "value": true
+    },
+    "send_log": {
+      "_description": "Optional path to append each sent caption line (UTC timestamp). Empty string disables logging. Safe for debugging; does not affect on-air output.",
+      "value": "/tmp/cc_demo_send.log"
+    }
+  },
+  "web": {
+    "_about": "Live monitor page that shows every caption line as it is sent.",
+    "enabled": {
+      "_description": "Serve the live web UI.",
+      "value": true
+    },
+    "host": {
+      "_description": "HTTP bind address. 0.0.0.0 = all interfaces.",
+      "value": "0.0.0.0"
+    },
+    "port": {
+      "_description": "HTTP port for the monitor page (0 = pick a free port). Open http://THIS_HOST:port/",
+      "value": 54003
+    }
+  },
+  "youtube": {
+    "_about": "Live YouTube caption ingest (./youtube_cc). Uses yt-dlp to find the stream's WebVTT caption playlist, then polls new cues into the injector. Works only if the live stream has captions / automatic captions.",
+    "url": {
+      "_description": "YouTube watch URL or video id for the live stream.",
+      "value": "https://www.youtube.com/watch?v=gCNeDWCI0vo"
+    },
+    "lang": {
+      "_description": "Caption language code to prefer (e.g. en, ar). Falls back to first available non-chat track.",
+      "value": "en"
+    },
+    "poll_sec": {
+      "_description": "How often to re-check the caption HLS playlist for new WebVTT segments. Use ~1.0 with exact mode for snappier updates.",
+      "value": 1.0
+    },
+    "refresh_playlist_sec": {
+      "_description": "How often to re-resolve the playlist URL via yt-dlp (signed URLs expire). Use 60–120 if you see HTTP 403 on segments.",
+      "value": 60.0
+    },
+    "exact": {
+      "_description": "EXACT YouTube cue mode (recommended). Shows the same caption block YouTube shows: replace on-screen text with that cue's VTT lines (line breaks preserved, original case). Does NOT mix lines from older cues. If false, re-wrap/roll like a ticker. CEA-608 still max 32 chars/line.",
+      "value": true
+    },
+    "single_upper": {
+      "_description": "youtube_eye: true = one caption line on the UPPER row only. false = fill up to captions.rows (recommended 3) with word-wrapped full sentences.",
+      "value": false
+    },
+    "player_delay_sec": {
+      "_description": "Seconds behind the caption HLS tip when picking the on-screen cue. Matches typical YouTube player A/V latency so the web/injector text aligns with what you see with CC enabled on youtube.com. Try 6–12 if it still feels early/late.",
+      "value": 8.0
+    },
+    "uppercase": {
+      "_description": "Force UPPERCASE in direct/exact mode (default false so text matches YouTube casing).",
+      "value": false
+    },
+    "poll_sec_direct": {
+      "_description": "Optional faster poll when exact/direct is true. Ignored if poll_sec is already lower.",
+      "value": 0.5
+    }
+  }
+}

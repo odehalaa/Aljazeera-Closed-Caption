@@ -1,222 +1,422 @@
+# Al Jazeera Closed Caption (CEA-608 / CEA-708 → MPEG-TS)
 
-# Live Caption Encoder (CEA‑608 → MPEG‑TS H.264)
+**Version 1.0**
 
-A lightweight C++17 tool that injects **CEA‑608 (A/53)** captions into a **live MPEG‑TS** stream in real time.  
-Captions are accepted over **UDP** (plain text) and embedded as **A/53 CC data** on the video frames before re-encoding and muxing to TS.
+Live closed-caption injector for MPEG-TS H.264. Plain-text captions arrive over UDP and are embedded as **CEA-608 (CC1)** and/or **CEA-708 (DTVCC Service 1)** inside **A/53 GA94 SEI** on the video bitstream. Video and audio are **bitstream-copied** (no re-encode).
 
-- **Input:** MPEG‑TS (UDP or file)  
-- **Output:** MPEG‑TS with 608 captions (H.264 by default, MPEG‑2 optional)  
-- **Caption Ingest:** UDP (e.g., from Whisper‑based STT)
+Typical use: take a live multicast/unicast TS, inject captions from a demo feed, live keyboard, HTTP API, or **YouTube on-screen captions**, and redistribute another multicast for VLC / STBs / playout.
 
-> Default behavior: decodes video, re-encodes with **H.264** (`libx264`, with `a53cc=1`) so 608 CC are carried as **user data SEI (GA94)** in the H.264 stream.
+---
+
+## Table of contents
+
+1. [Features](#features)
+2. [Architecture](#architecture)
+3. [Requirements](#requirements)
+4. [Build](#build)
+5. [Configuration (`config.json`)](#configuration-configjson)
+6. [Run](#run)
+7. [Caption sources](#caption-sources)
+8. [UDP caption protocol](#udp-caption-protocol)
+9. [Watch / test in VLC](#watch--test-in-vlc)
+10. [CLI reference (`cc_injector`)](#cli-reference-cc_injector)
+11. [Scripts cheat sheet](#scripts-cheat-sheet)
+12. [Troubleshooting](#troubleshooting)
+13. [License](#license)
 
 ---
 
 ## Features
 
-- **Real‑time 608 injection** (A/53 cc_data side data on frames).
-- **UDP text input** (plain ASCII, up to **32 chars** per line).
-- **RU2 (two‑line roll‑up)** with duplicate suppression:
-  - Rolls only when a new caption is **distinct** from the current bottom line.
-  - Repaints when the same caption repeats (prevents duplicate two-line stack).
-- **Bootstrap caption** (“CC ONLINE”) helps players expose CC track quickly.
-- **Linger window** preserves last caption briefly for stability.
-- Audio passthrough via **decode → AAC encode → TS** (if audio present).
+| Area | What you get |
+|------|----------------|
+| Standards | CEA-608 CC1, CEA-708 Service 1, or **both** |
+| Transport | MPEG-TS in → MPEG-TS out (UDP file/unicast/multicast) |
+| Video | H.264 Annex-B **copy** + A/53 SEI inject |
+| Audio | Passthrough when present |
+| Layout | 2–4 roll-up rows, PAC row 1–15, width ≤ 32 |
+| Style | Color, underline, italics, flash, indent; 708 font + pen size |
+| Ingest | UDP text, RSS/JSON demo, live type, HTTP gateway, YouTube eye |
+| Clear | Strong CLEAR (EDM + per-row DER, repeated) so leftovers vanish |
+| Monitor | Local web page showing exact UDP payloads |
+
+---
+
+## Architecture
+
+```
+  ┌─────────────────────┐     UDP text      ┌──────────────────┐
+  │ demo / live_type /  │ ───────────────►  │   cc_injector    │
+  │ youtube_eye / HTTP  │   :54001          │  (C++ / FFmpeg)  │
+  └─────────────────────┘                   └────────┬─────────┘
+                                                     │
+     MPEG-TS in (e.g. 239.195.1.17:4900) ───────────┤
+                                                     ▼
+                                            MPEG-TS out + CC
+                                            (e.g. 239.195.11.11:4900)
+                                                     │
+                                                     ▼
+                                              VLC / STB (CC1)
+```
+
+- **`cc_injector`** — core encoder path: read TS, inject SEI, write TS.
+- **`config.json` + `cc_config.py`** — documented JSON; CLI/env override.
+- **`demo.py` / `./demo`** — RSS/JSON/text → UDP + optional web UI.
+- **`youtube_player_cc.py` / `./youtube_eye`** — Playwright scrapes YouTube **on-screen** `.ytp-caption-segment` (what eyes see), queues line-by-line, CLEAR between cues.
+- **`youtube_live_cc.py` / `./youtube_cc`** — alternate path via yt-dlp WebVTT (can differ from player overlay).
+- **`live_type.py`** — keyboard typing into captions.
+- **`caption_http.py`** — HTTP → UDP bridge.
 
 ---
 
 ## Requirements
 
-**Tested on:** Ubuntu 24.04+
-
-- g++ (C++17)
-- FFmpeg dev libraries:  
-  `libavformat`, `libavcodec`, `libavutil`, `libswresample`
-- `pkg-config`
-- `netcat` (recommended)
-- `ffmpeg` (for test stream generation)
-
-Install (Ubuntu):
+**Tested on:** Ubuntu 24.04+ (Linux).
 
 ```bash
 sudo apt update
 sudo apt install -y \
   g++ pkg-config \
   libavformat-dev libavcodec-dev libavutil-dev libswresample-dev \
-  ffmpeg netcat
+  ffmpeg netcat-openbsd \
+  python3 python3-venv python3-pip
 ```
 
-> **Note:** Uses POSIX sockets. Windows support would require Winsock changes.
+Optional (YouTube player-eye):
+
+```bash
+cd /path/to/Aljazeera-Closed-Caption
+python3 -m venv .venv
+.venv/bin/pip install playwright
+.venv/bin/playwright install chromium
+```
+
+Optional (YouTube WebVTT path): `pip install yt-dlp` (system or venv).
 
 ---
 
 ## Build
 
 ```bash
-g++ -std=c++17 cc_injector.cpp \
+git clone https://github.com/odehalaa/Aljazeera-Closed-Caption.git
+cd Aljazeera-Closed-Caption
+
+g++ -std=c++17 -O2 cc_injector.cpp \
   $(pkg-config --cflags --libs libavformat libavcodec libavutil libswresample) \
   -o cc_injector
+
+./cc_injector --help
 ```
 
-Produces:
-
-```
-./cc_injector
-```
+`./start_injector.sh` builds automatically if `./cc_injector` is missing.
 
 ---
 
-## Quickstart
+## Configuration (`config.json`)
 
-### 1) Start a test **H.264** TS source → UDP:5000
+All runtime knobs live in **`config.json`**. Keys starting with `_` are documentation only and are ignored by the loader.
+
+**Override order (highest wins):** CLI flags → environment variables → `config.json`.
+
+```bash
+python3 ./cc_config.py ./config.json --env          # print shell exports
+python3 ./cc_config.py ./config.json --env IN       # one value
+ROWS=2 ./start_injector.sh                          # env override
+```
+
+### `stream` — MPEG-TS path
+
+| Key | Type | Default (example) | Description |
+|-----|------|-------------------|-------------|
+| `input` | string | `udp://239.195.1.17:4900?localaddr=…` | Source MPEG-TS. For multicast, set `localaddr=` to **this machine’s NIC IP**. |
+| `output` | string | `udp://239.195.11.11:4900?pkt_size=1316&ttl=16&localaddr=…` | Destination viewers tune (VLC: `udp://@239.195.11.11:4900`). |
+| `caption_udp` | string | `0.0.0.0:54001` | Bind address for UDP caption ingest. |
+
+Edit `localaddr` to match your NIC before production use.
+
+### `captions` — look & behaviour (passed to `cc_injector`)
+
+| Key | Allowed | Default | Description |
+|-----|---------|---------|-------------|
+| `rows` | 2, 3, 4 | `3` | Max roll-up window. Senders normally use 1–2 lines; 3rd only if needed. |
+| `row` | 1..15 | `13` | Base PAC row (15 = bottom). Window grows **upward**. |
+| `width` | 8..32 | `32` | Max ASCII chars per line (CEA-608 hard limit 32). |
+| `timeout_ms` | ≥0 | `12000` | Auto-CLEAR after idle ms (`0` = never). |
+| `color` | white green blue cyan red yellow magenta | `yellow` | Foreground. |
+| `cc` | `608` / `708` / `both` | `both` | `608` = universal CC1; `708` adds font/size; `both` recommended. |
+| `font` | 0..7 | `0` | CEA-708 only. **0 = default** (most compatible). 1 mono, 2 prop, 3 mono_sans, 4 casual, 5 cursive, 6 small_caps, 7 prop_sans. |
+| `pen_size` | small / standard / large | `standard` | CEA-708 size. `standard` safest across players. |
+| `bootstrap` | 0 / 1 | `0` | Inject short “CC ONLINE” at start. |
+| `sei_every` | 1..30 | `15` | Re-send keep-alive SEI every N video packets while holding. |
+| `clear_frames` | 1..120 | `6` | Repeat CLEAR (EDM + row DER) this many packets. VLC often needs ≥4–6. |
+
+### `demo` — internet headline ticker
+
+| Key | Description |
+|-----|-------------|
+| `host` / `port` | Where to send UDP (`127.0.0.1:54001`). |
+| `sources` | List of RSS/Atom/JSON/text URLs. |
+| `source_type` | `auto` / `rss` / `atom` / `json` / `text`. |
+| `json_key` | Field name when parsing JSON (default `title`). |
+| `every` | Seconds each wrapped line stays on air. |
+| `cps` | Chars/sec typing effect (`0` = whole line). |
+| `limit` | Max items per fetch. |
+| `refresh` | Seconds before refetch after a full pass. |
+| `uppercase` | Force UPPER CASE. |
+| `apply_injector` | Restart local injector from this config before sending. |
+| `send_log` | Optional path for send log (empty = off). |
+
+### `web` — live monitor
+
+| Key | Description |
+|-----|-------------|
+| `enabled` | Serve monitor UI. |
+| `host` | Bind (`0.0.0.0` = all interfaces). |
+| `port` | HTTP port (default `54003`). Open `http://HOST:54003/`. |
+
+### `youtube` — live YouTube ingest
+
+| Key | Description |
+|-----|-------------|
+| `url` | Watch URL or video id. |
+| `lang` | Preferred caption language. |
+| `poll_sec` | Playlist / poll interval. |
+| `refresh_playlist_sec` | Re-resolve yt-dlp URL (signed URLs expire). |
+| `exact` | Exact cue blocks (WebVTT path). |
+| `single_upper` | `youtube_eye`: one upper line only if `true`. |
+| `player_delay_sec` | WebVTT vs player latency heuristic. |
+| `uppercase` | Force upper in direct/exact mode. |
+| `poll_sec_direct` | Faster poll hint for exact mode. |
+
+---
+
+## Run
+
+### A) Production-style: config → injector
+
+```bash
+# 1. Edit config.json (input/output/localaddr/rows/row/color/…)
+
+# 2. Start injector
+./start_injector.sh ./config.json
+
+# Or manually:
+IN=$(python3 ./cc_config.py ./config.json --env IN)
+OUT=$(python3 ./cc_config.py ./config.json --env OUT)
+CC_UDP=$(python3 ./cc_config.py ./config.json --env CC_UDP)
+./cc_injector "$IN" "$OUT" \
+  --cc-udp="$CC_UDP" \
+  --rows=3 --width=32 --row=13 \
+  --timeout_ms=12000 \
+  --cc=both --font=0 --pen_size=standard \
+  --color=yellow --bootstrap=1 \
+  --sei_every=2 --clear_frames=6 --cc_every=1
+```
+
+### B) Local loopback test (no multicast)
+
+**Terminal 1 — fake video:**
 
 ```bash
 ffmpeg -re \
-  -f lavfi -i smptebars=size=1280x720:rate=30000/1001 \
+  -f lavfi -i smptebars=size=1280x720:rate=25 \
   -f lavfi -i sine=frequency=440:sample_rate=48000 \
   -map 0:v -map 1:a \
-  -c:v libx264 -preset veryfast -pix_fmt yuv420p -g 60 \
-  -c:a aac -b:a 128k -ar 48000 -ac 2 \
+  -c:v libx264 -preset veryfast -pix_fmt yuv420p -g 50 \
+  -c:a aac -b:a 128k \
   -f mpegts "udp://127.0.0.1:5000?pkt_size=1316"
 ```
 
----
-
-### 2) Run the caption injector
+**Terminal 2 — injector:**
 
 ```bash
 ./cc_injector \
-  "udp://127.0.0.1:5000?timeout=5000000&fifo_size=1000000&overrun_nonfatal=1" \
+  "udp://127.0.0.1:5000?fifo_size=1000000&overrun_nonfatal=1&timeout=5000000" \
   "udp://127.0.0.1:5004?pkt_size=1316" \
-  --cc-udp=127.0.0.1:54001
+  --cc-udp=0.0.0.0:54001 \
+  --rows=2 --width=32 --row=15 \
+  --cc=both --font=0 --pen_size=standard \
+  --color=yellow --timeout_ms=8000 --clear_frames=6
 ```
 
-- Input TS: **5000**
-- Output TS: **5004**
-- Caption ingest: **54001/UDP**
-
-**Optional flags:**
-- `--venc=libx264` (default)
-- `--venc=mpeg2video`
-- `--bootstrap=1|0`
-- `--linger_ms=N` (default 750)
-
----
-
-### 3) Send a caption via UDP
+**Terminal 3 — send text:**
 
 ```bash
-printf "Hello captions\n" | nc -u -w0 127.0.0.1 54001
+printf 'HELLO WORLD\n' | nc -u -w0 127.0.0.1 54001
+printf 'Line one|Line two\n' | nc -u -w0 127.0.0.1 54001
+printf 'CLEAR\n' | nc -u -w0 127.0.0.1 54001
 ```
 
----
+**Terminal 4 — VLC:** open `udp://@127.0.0.1:5004` → Subtitle → **Closed Captions / CC1**.
 
-### 4) View output in VLC (important: watch the output port)
-
-```
-udp://@127.0.0.1:5004
-```
-
-Then enable:
-
-**Subtitle → Sub Track → Track 1 (CC1)**
-
-> VLC may not show a CC track until the first caption arrives; bootstrap caption helps.
-
----
-
-## How it works (overview)
-
-- Reads MPEG‑TS input using FFmpeg.
-- Decodes video → attaches A/53 CC triplets as frame side-data.
-- Re-encodes using **libx264** or **MPEG‑2**.
-- Writes CC via **GA94 SEI (H.264)** or **user data 0xB2 (MPEG‑2)** depending on encoder.
-- Audio is decoded and re‑encoded to **AAC** if present.
-- Caption logic:
-  - **RU2 (roll‑up 2 lines)**
-  - Duplicate suppression
-  - Smart repaint vs roll selection
-  - Bootstrap + linger for player compatibility
-
----
-
-## Command-Line Usage
+### C) Demo ticker + web monitor
 
 ```bash
-# Basic
-./cc_injector input.ts output.ts --cc-udp=127.0.0.1:54001
-
-# Specify encoder
-./cc_injector in.ts out.ts --venc=libx264
-./cc_injector in.ts out.ts --venc=mpeg2video
-
-# Customize bootstrap / linger
-./cc_injector in.ts out.ts --bootstrap=0 --linger_ms=1500
+./demo
+# Web UI: http://<host>:54003/
 ```
 
-**Defaults when no args supplied:**
+### D) YouTube on-screen captions (recommended for “as eyes see”)
 
+```bash
+./start_injector.sh ./config.json &
+./youtube_eye --config ./config.json \
+  --url 'https://www.youtube.com/watch?v=VIDEO_ID' \
+  --poll 0.15 --rows=3
 ```
-Input      udp://127.0.0.1:5000
-Output     output.ts
-Encoder    libx264
-Bootstrap  enabled
-Linger     750 ms
-```
+
+Behaviour:
+
+- Scrapes `.ytp-caption-segment` in a headless Chromium player.
+- Snaps to YouTube **LIVE** badge.
+- Preserves YouTube line breaks (wraps only if &gt; 32 chars).
+- Queues cues so fast speech is not skipped.
+- Sends **CLEAR** before each new cue so previous glyphs do not linger.
 
 ---
 
-## audioWhisper Integration (STT.py)
+## Caption sources
 
-It is highly recommended to run this on another computer. NVidia Graphics card with at least 10 Gigs of ram and CUDA cores. Works great on a P6000 with the Large models.
+| Tool | Command | Notes |
+|------|---------|-------|
+| Manual UDP | `nc -u` | Fastest smoke test |
+| Random test | `./send_random_captions.sh` | Stress / demo |
+| RSS demo | `./demo` | Uses `config.json` → `demo` + `web` |
+| Live keyboard | `./run_live_type.sh` or `python3 live_type.py 127.0.0.1 54001` | Enter = new line |
+| HTTP bridge | `./run_caption_http.sh` | POST text → UDP |
+| YouTube eye | `./youtube_eye` | Player overlay (Playwright) |
+| YouTube VTT | `./youtube_cc` | yt-dlp WebVTT (may differ from overlay) |
 
-Setup:
+---
 
-1. Clone audioWhisper:
-   ```bash
-   git clone https://github.com/awexandrr/audioWhisper
-   cd audioWhisper
-   python3 -m venv .venv && source .venv/bin/activate
-   pip install -r requirements.txt
-   ```
+## UDP caption protocol
 
-2. Copy your modified STT.py into the audioWhisper repo:
-   ```bash
-   cp /path/to/Live-Caption-Encoder/STT.py /path/to/audioWhisper/STT.py
-   ```
+Send to `--cc-udp` (default port **54001**):
 
-3. Run STT.py  
-   It will automatically send caption text to your injector over UDP  
-   (default in code: `127.0.0.1:54001`).
+| Payload | Effect |
+|---------|--------|
+| `Hello captions\n` | One line (auto word-wrap at `--width`) |
+| `Line one\|Line two\n` | Multi-line window (`\|` = hard break) |
+| `CLEAR` / `CLS` / empty datagram | Erase on-screen captions |
+| `[yellow+u]ALERT` | Inline style for that message |
 
-> If using a different host/port, pass the same to `--cc-udp` on `cc_injector`.
+**Inline tags:** colors `w/g/b/c/r/y/m`, `+u` underline, `+i` italics, `+flash`, `+bgNAME`, `+bgtransparent`.
+
+ASCII only (`0x20`–`0x7E`). Max **32** characters per painted line.
+
+---
+
+## Watch / test in VLC
+
+1. Media → Open Network: `udp://@239.195.11.11:4900` (or your `stream.output`).
+2. Subtitle menu → **Closed Captions** → **CC1** (608).  
+   For 708: DTVCC / Service 1 if listed.
+3. If nothing shows: confirm injector log has `[cc] recv: …`, try `--bootstrap=1`, raise `clear_frames`.
+
+---
+
+## CLI reference (`cc_injector`)
+
+```text
+./cc_injector [input] [output] [options]
+./cc_injector -h | --help
+```
+
+### Core
+
+| Flag | Meaning |
+|------|---------|
+| `--cc-udp=HOST:PORT` | UDP caption listen (required for live text) |
+| `--bootstrap=0\|1` | Startup “CC ONLINE” |
+| `--rows=N` / `--ru=N` | 2..4 visible roll-up lines |
+| `--row=N` / `--base_row=N` | PAC row 1..15 (15 = bottom) |
+| `--width=N` / `--cols=N` | Max chars/line (≤32) |
+| `--timeout_ms=N` | Auto-CLEAR idle (`0` = never) |
+| `--cc_every=N` | Inject on every Nth video packet |
+| `--line_gap=N` | Packets between rolled lines |
+| `--clear_frames=N` | CLEAR repeat count |
+| `--sei_every=N` | Keep-alive SEI spacing |
+| `--quiet` | Less logging |
+| `--fast` | Low-latency preset (also quieter) |
+| `--live` | Force overwrite mode (no roll-up) |
+
+### Format / style
+
+| Flag | Meaning |
+|------|---------|
+| `--cc=608\|708\|both` | Which standards to embed |
+| `--font=0..7` | 708 font tag |
+| `--pen_size=small\|standard\|large` | 708 size |
+| `--color=NAME` | Foreground |
+| `--bg=NAME` | Background (many STBs ignore) |
+| `--indent=N` | 0,4,8,…,28 |
+| `--underline` / `--italics` / `--flash` | Style |
+
+---
+
+## Scripts cheat sheet
+
+| Script | Purpose |
+|--------|---------|
+| `./start_injector.sh [config.json]` | Build if needed + start from config |
+| `./demo` | RSS/demo + web monitor |
+| `./youtube_eye` | YouTube player overlay → UDP |
+| `./youtube_cc` | YouTube WebVTT → UDP |
+| `./run_live_type.sh` | Keyboard captions |
+| `./run_caption_http.sh` | HTTP → UDP |
+| `./send_random_captions.sh` | Random test lines |
+| `./run_injector.sh` / `./run_injector_fast.sh` | Legacy launcher helpers |
 
 ---
 
 ## Troubleshooting
 
-- **No captions showing:**
-  - Make sure VLC is connected to **output port (5004)**, not input.
-  - Enable **Subtitle → Sub Track → Track 1**.
-  - Wait for the first caption or use bootstrap.
+| Symptom | Fix |
+|---------|-----|
+| No CC in VLC | Enable **CC1**; use injector **output** URL; try `--bootstrap=1` |
+| Leftover characters after CLEAR | Raise `clear_frames` (6–8); ensure CLEAR finishes before next text (current code does) |
+| Truncated last letters (`offering`→`offer`) | SEI queue must drain; use current `cc_injector` (do not wipe undrained queue) |
+| Web ≠ YouTube text | Prefer `./youtube_eye` (overlay) over WebVTT; snap LIVE badge |
+| Multicast not received | Set `localaddr=` to correct NIC; check IGMP / firewall |
+| Font ignored | `--cc=608` has no font; use `--cc=both` and `--font=0` |
+| Flicker | Raise `--sei_every`; avoid spamming identical paints |
 
-- **Long caption delays or missing lines:**
-  - Reduce network buffering on input.
-  - Ensure sender sends only ASCII 0x20–0x7E.
+Logs:
 
-- **Duplicate lines in roll‑up:**
-  - Injector suppresses duplicates; check STT sender isn’t adding spaces or CRs.
-
-- **Windows build issues:**
-  - Replace POSIX sockets with Winsock equivalents.
+```bash
+tail -f /tmp/cc_injector.log    # if started via tee/start script
+# Look for: [cc] recv: …   [cc] CLEAR start …   [cc] queue len=…
+```
 
 ---
 
-## Known Limitations
+## Project layout
 
-- CEA‑608 **Field 1 only** (0xFC header).
-- Max **32 characters** per caption.
-- ASCII only (non‑ASCII filtered).
-- RU2 only (roll‑up 2‑line).
-- No CEA‑708 yet.
-- Basic PAC attributes (white text, no underline, bottom row).
+```text
+cc_injector.cpp      Core injector (build → cc_injector)
+config.json          Documented runtime config
+cc_config.py         Config loader / env export
+demo.py / demo       Internet caption demo + web UI
+youtube_player_cc.py YouTube on-screen eye
+youtube_eye          Launcher for player eye
+youtube_live_cc.py   YouTube WebVTT ingest
+youtube_cc           Launcher for WebVTT path
+live_type.py         Keyboard → UDP
+caption_http.py      HTTP → UDP
+start_injector.sh    Config-driven injector start
+AGENTS.md            Deep dive for humans & coding agents
+README.md            This file
+LICENSE              MIT
+```
+
+---
+
+## License
+
+MIT — see [LICENSE](LICENSE).
+
+---
+
+## Release
+
+**v1.0** — Live CEA-608/708 MPEG-TS injector with JSON config, demo/web monitor, YouTube eye ingest, strong CLEAR, and dual 608+708 output.
