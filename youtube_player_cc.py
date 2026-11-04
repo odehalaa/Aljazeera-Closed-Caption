@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import socket
 import sys
 import time
@@ -95,6 +96,14 @@ READ_JS = r"""
     liveText: live ? (live.innerText || '').trim() : null,
     href: location.href,
     cc: !!document.querySelector('.ytp-caption-segment, .captions-text'),
+    ccOn: (() => {
+      const b = document.querySelector('.ytp-subtitles-button');
+      if (!b) return null;
+      const pressed = b.getAttribute('aria-pressed');
+      if (pressed === 'true') return true;
+      if (pressed === 'false') return false;
+      return null;
+    })(),
   };
 }
 """
@@ -228,6 +237,35 @@ def caption_grows(prev_key: str, new_key: str) -> bool:
     prev0 = prev_key.split("|", 1)[0]
     new0 = new_key.split("|", 1)[0]
     return new0.startswith(prev0) and len(new_key) >= len(prev_key)
+
+
+_NON_SPEECH = re.compile(
+    r"^\[?\s*(music|applause|laughter|cheering|silence)\s*\]?\s*$",
+    re.IGNORECASE,
+)
+
+
+def filter_youtube_overlay_lines(raw: list) -> list[str]:
+    """Keep only real on-screen caption lines (drop [Music] SFX-only rows)."""
+    out: list[str] = []
+    for x in raw:
+        t = str(x).strip()
+        if not t:
+            continue
+        if _NON_SPEECH.match(t):
+            continue
+        if t.startswith(">>") and _NON_SPEECH.match(t[2:].strip()):
+            continue
+        out.append(t)
+    return out
+
+
+def overlay_cc_active(info: dict) -> bool:
+    if info.get("ccOn") is False:
+        return False
+    if not info.get("cc"):
+        return False
+    return True
 
 
 def paint_lines(
@@ -402,7 +440,7 @@ def main() -> int:
         "config": args.config,
         "source": "youtube-player-eye",
         "track": "ytp-caption-segment (on-screen)",
-        "note": "Scraping YouTube player overlay for gCNeDWCI0vo — snap to live edge.",
+        "note": "YouTube player overlay only — finalized cues (no partial word spam).",
         "mode": "youtube-eye-upper1" if single_upper else "youtube-eye",
         "url": args.url,
         "rows": rows,
@@ -514,6 +552,9 @@ def main() -> int:
             stable_need = 2
             tx_queue: deque[list[str]] = deque()
             last_queued_key = ""
+            last_emitted_key = ""
+            draft_key = ""
+            draft_window: list[str] | None = None
             min_dwell = 0.12
             queue_warn = 48
             cleared_idle = False
@@ -528,6 +569,7 @@ def main() -> int:
             def do_idle_clear(now: float) -> None:
                 nonlocal last_lines, last_key, last_queued_key, cleared_idle
                 nonlocal last_caption_udp_at, tx_queue, pending_key, stable_hits
+                nonlocal draft_key, draft_window, last_emitted_key
                 print(
                     f"[yt-eye] idle clear ({idle_clear_sec:.0f}s no overlay text)",
                     file=sys.stderr,
@@ -537,11 +579,34 @@ def main() -> int:
                 last_lines = []
                 last_key = ""
                 last_queued_key = ""
+                last_emitted_key = ""
+                draft_key = ""
+                draft_window = None
                 pending_key = ""
                 stable_hits = 0
                 tx_queue.clear()
                 cleared_idle = True
                 last_caption_udp_at = now
+
+            def enqueue_cue(window: list[str], *, log_lines: list[str]) -> None:
+                nonlocal last_emitted_key, last_queued_key, last_lines, last_change
+                if not window or not any(str(x).strip() for x in window):
+                    return
+                tx_queue.append(list(window))
+                key = "|".join(window)
+                last_emitted_key = key
+                last_queued_key = key
+                last_lines = list(window)
+                last_change = time.time()
+                print(f"[yt-eye] cue: {log_lines!r}", file=sys.stderr)
+
+            def flush_draft() -> None:
+                nonlocal draft_key, draft_window
+                if draft_key and draft_window:
+                    src = draft_key.split("|")
+                    enqueue_cue(draft_window, log_lines=src)
+                draft_key = ""
+                draft_window = None
 
             def recover_player(reason: str) -> None:
                 print(f"[yt-eye] recover: {reason}", file=sys.stderr)
@@ -606,7 +671,10 @@ def main() -> int:
                     page.evaluate(ENABLE_CC_JS)
                     continue
                 raw_lines = info.get("lines") or []
-                lines = [ascii608(str(x)) for x in raw_lines if str(x).strip()]
+                if not overlay_cc_active(info):
+                    raw_lines = []
+                filtered = filter_youtube_overlay_lines(raw_lines)
+                lines = [ascii608(str(x)) for x in filtered if str(x).strip()]
                 if "atLive" in info:
                     style["at_live"] = bool(info.get("atLive"))
                 if info.get("paused"):
@@ -630,7 +698,7 @@ def main() -> int:
                         pending_lines = list(lines)
                         stable_hits = 1
 
-                    if stable_hits >= stable_need and key != last_queued_key:
+                    if stable_hits >= stable_need:
                         windows = paint_windows(
                             pending_lines,
                             width=width,
@@ -638,58 +706,33 @@ def main() -> int:
                             uppercase=uppercase,
                             single_upper=single_upper,
                         )
-                        if windows:
-                            growing = caption_grows(last_queued_key, key)
-                            if growing:
-                                had_q = len(tx_queue)
-                                if tx_queue:
-                                    tx_queue.pop()
-                                tx_queue.extend(windows)
-                                print(
-                                    f"[yt-eye] grow: {pending_lines!r}",
-                                    file=sys.stderr,
-                                )
-                                if had_q == 0:
-                                    emit_painted(
-                                        sock,
-                                        addr,
-                                        windows[-1],
-                                        on_send,
-                                        publish=True,
-                                        history=False,
-                                    )
-                                    last_caption_udp_at = now
-                                    last_udp_hold = now
-                            else:
-                                print(
-                                    f"[yt-eye] see: {pending_lines!r}",
-                                    file=sys.stderr,
-                                )
-                                for w in windows:
-                                    tx_queue.append(w)
-                                if len(tx_queue) >= queue_warn:
-                                    print(
-                                        f"[yt-eye] queue depth {len(tx_queue)} "
-                                        f"(draining, no drop)",
-                                        file=sys.stderr,
-                                    )
-                            last_queued_key = key
+                        if not windows:
+                            pass
+                        else:
+                            w = list(windows[-1])
+                            grow_ref = draft_key or last_emitted_key
+                            if caption_grows(grow_ref, key):
+                                draft_key = key
+                                draft_window = w
+                            elif key != last_emitted_key:
+                                flush_draft()
+                                enqueue_cue(w, log_lines=pending_lines)
                             last_key = key
-                            last_lines = list(windows[-1])
-                            last_change = now
-                    elif key == last_key:
-                        if (now - last_change) >= 12.0 and not tx_queue:
-                            recover_player(f"same caption {now - last_change:.0f}s")
-                            last_change = now
-                            last_key = ""
-                            last_queued_key = ""
-                            pending_key = ""
-                            stable_hits = 0
+                    elif key == last_key and (now - last_change) >= 12.0 and not tx_queue:
+                        recover_player(f"same caption {now - last_change:.0f}s")
+                        last_key = ""
+                        last_emitted_key = ""
+                        draft_key = ""
+                        draft_window = None
+                        pending_key = ""
+                        stable_hits = 0
                 else:
                     pending_key = ""
                     pending_lines = []
                     stable_hits = 0
                     empty_polls += 1
+                    if empty_polls >= stable_need and draft_key:
+                        flush_draft()
                     if empty_polls == 1 or empty_polls % 20 == 0:
                         print(
                             f"[yt-eye] no overlay (cc={info.get('cc')} "

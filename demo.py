@@ -168,7 +168,7 @@ PAGE_HTML = r"""<!DOCTYPE html>
 <main>
   <header>
     <h1>Live caption monitor</h1>
-    <div class="sub">Read-only view of UDP sent to the injector (YouTube eye).</div>
+    <div class="sub">Read-only — finalized YouTube on-screen captions only (same UDP as TV).</div>
     <div class="status"><span id="dot" class="dot"></span><span id="conn">connecting…</span></div>
     <div class="cfg" id="cfg"></div>
   </header>

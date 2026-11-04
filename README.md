@@ -62,7 +62,7 @@ Typical use: take a live multicast/unicast TS, inject captions from a demo feed,
 - **`cc_injector`** — core encoder path: read TS, inject SEI, write TS.
 - **`config.json` + `cc_config.py`** — documented JSON; CLI/env override.
 - **`demo.py` / `./demo`** — RSS/JSON/text → UDP + optional web UI.
-- **`youtube_player_cc.py` / `./youtube_eye`** — Playwright scrapes YouTube **on-screen** overlay lines; new text **replaces** the previous caption (no flash CLEAR). Sends **CLEAR** only after `timeout_ms` with no overlay text (default **8000** ms).
+- **`youtube_player_cc.py` / `./youtube_eye`** — Playwright reads **only** the YouTube CC overlay (CC on, no `[Music]` rows). **Finalized** cues go on air when the overlay clears or the next cue starts — not every word while typing. New text replaces the previous caption; **CLEAR** after `timeout_ms` with no overlay text (default **8000** ms).
 - **`youtube_live_cc.py` / `./youtube_cc`** — alternate path via yt-dlp WebVTT (can differ from player overlay).
 - **`live_type.py`** — keyboard typing into captions.
 - **`caption_http.py`** — HTTP → UDP bridge.
