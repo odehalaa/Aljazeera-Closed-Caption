@@ -558,6 +558,10 @@ def main() -> int:
             min_dwell = 0.12
             queue_warn = 48
             cleared_idle = False
+            tx_phase = "idle"
+            tx_phase_at = 0.0
+            tx_pending: list[str] = []
+            cue_clear_gap = float(cap.get("cue_clear_gap") or 0.18)
             video_id = args.url.rstrip("/").split("v=")[-1].split("&")[0][:16]
             last_text_at = time.time()
 
@@ -759,20 +763,31 @@ def main() -> int:
                         seen_since = now
                         empty_polls = 0
 
-                # Next caption overwrites the previous — no CLEAR flash between cues.
-                if tx_queue and (now - last_udp_hold) >= min_dwell:
-                    w = tx_queue.popleft()
+                # Full CLEAR all window rows, then next cue (1–2 lines use only those rows).
+                if (
+                    tx_phase == "idle"
+                    and tx_queue
+                    and (now - last_udp_hold) >= min_dwell
+                ):
+                    tx_pending = tx_queue.popleft()
+                    send_udp(sock, addr, "CLEAR")
+                    hub.publish("CLEAR", "", history=False)
+                    tx_phase = "clearing"
+                    tx_phase_at = now
+                elif tx_phase == "clearing" and (now - tx_phase_at) >= cue_clear_gap:
                     emit_painted(
                         sock,
                         addr,
-                        w,
+                        tx_pending,
                         on_send,
                         publish=True,
                         history=True,
                     )
                     last_caption_udp_at = now
                     last_udp_hold = now
-                    last_lines = list(w)
+                    last_lines = list(tx_pending)
+                    tx_pending = []
+                    tx_phase = "idle"
                     cleared_idle = False
 
                 time.sleep(poll)

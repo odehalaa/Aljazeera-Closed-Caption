@@ -62,7 +62,7 @@ Typical use: take a live multicast/unicast TS, inject captions from a demo feed,
 - **`cc_injector`** — core encoder path: read TS, inject SEI, write TS.
 - **`config.json` + `cc_config.py`** — documented JSON; CLI/env override.
 - **`demo.py` / `./demo`** — RSS/JSON/text → UDP + optional web UI.
-- **`youtube_player_cc.py` / `./youtube_eye`** — Playwright reads **only** the YouTube CC overlay (CC on, no `[Music]` rows). **Finalized** cues go on air when the overlay clears or the next cue starts — not every word while typing. New text replaces the previous caption; **CLEAR** after `timeout_ms` with no overlay text (default **8000** ms).
+- **`youtube_player_cc.py` / `./youtube_eye`** — Playwright reads **only** the YouTube CC overlay (CC on, no `[Music]` rows). **Finalized** cues go on air when the overlay clears or the next cue starts. Each new cue is preceded by a **full window CLEAR** (all `rows`, e.g. 3) so unused lines are blank; 1–2 line cues only use those rows. **Idle CLEAR** after `timeout_ms` with no overlay text (default **8000** ms).
 - **`youtube_live_cc.py` / `./youtube_cc`** — alternate path via yt-dlp WebVTT (can differ from player overlay).
 - **`live_type.py`** — keyboard typing into captions.
 - **`caption_http.py`** — HTTP → UDP bridge.
@@ -271,8 +271,8 @@ Behaviour:
 - Snaps to YouTube **LIVE** badge.
 - Preserves YouTube line breaks (wraps only if &gt; 32 chars).
 - Queues cues so fast speech is not skipped.
-- New cues **overwrite** the previous caption on the injector (no blank gap between lines).
-- Sends **CLEAR** only when the YouTube overlay has been empty for `captions.timeout_ms` (default 8 seconds).
+- Each new finalized cue: **CLEAR** all caption rows (`clear_frames` in MPEG-TS), brief gap, then paint the next 1–2 lines.
+- **Idle CLEAR** when the YouTube overlay has been empty for `captions.timeout_ms` (default 8 seconds).
 
 ---
 

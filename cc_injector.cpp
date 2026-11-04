@@ -544,6 +544,15 @@ static void build_popon_window(std::vector<uint8_t>& out, const std::vector<std:
     const size_t first = lines.size() - (size_t)n;
     push_pair(out, 0x14, 0x20);
     push_pair(out, 0x14, 0x2E);
+    const int bottom_row = (int)base_row;
+    const int top_row = std::max(1, bottom_row - max_rows + 1);
+    const int content_top = std::max(top_row, bottom_row - (n - 1));
+    for (int row = top_row; row < content_top; ++row) {
+        uint8_t p1 = 0, p2 = 0;
+        build_pac_for_row((uint8_t)row, p1, p2, false, 0, -1);
+        push_pair(out, p1, p2);
+        push_pair(out, 0x14, 0x24);
+    }
     for (int i = 0; i < n; ++i) {
         int row = (int)base_row - (n - 1 - i);
         if (row < 1) row = 1;
