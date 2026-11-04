@@ -53,9 +53,14 @@ def validate_config(cfg: dict[str, Any]) -> list[str]:
         warnings.append(f"captions.row clamped to {row} (allowed 1..15)")
     cap["row"] = row
 
-    width = _clamp_int(cap.get("width", 32), 8, 32, 32)
+    width = _clamp_int(cap.get("width", 31), 8, 32, 31)
     if width != cap.get("width"):
         warnings.append(f"captions.width clamped to {width} (allowed 8..32)")
+    if width == 32 and str(cap.get("color", "yellow")).lower() not in ("white", "w"):
+        warnings.append(
+            "captions.width=32 with a colour: the mid-row colour code uses one cell, "
+            "so the 32nd character is lost on TVs — use 31"
+        )
     cap["width"] = width
 
     try:

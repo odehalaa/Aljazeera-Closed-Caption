@@ -41,12 +41,12 @@ DEFAULT_SOURCES = [
 
 UA = "CC608-Demo/1.0 (+live caption injector)"
 
-PAGE_HTML = """<!DOCTYPE html>
+PAGE_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>CC Demo — live captions</title>
+<title>CC monitor — YouTube on-air</title>
 <style>
   :root {
     --bg: #0b1020;
@@ -167,8 +167,8 @@ PAGE_HTML = """<!DOCTYPE html>
 <body>
 <main>
   <header>
-    <h1>Live caption demo</h1>
-    <div class="sub">Every line sent to the CEA-608 injector appears here in real time.</div>
+    <h1>Live caption monitor</h1>
+    <div class="sub">Read-only view of UDP sent to the injector (YouTube eye).</div>
     <div class="status"><span id="dot" class="dot"></span><span id="conn">connecting…</span></div>
     <div class="cfg" id="cfg"></div>
   </header>
@@ -204,7 +204,7 @@ function renderCc(ev) {
   // display = exact UDP payload sent to cc_injector (line1|line2)
   const payload = (ev.display != null && String(ev.display).length)
     ? String(ev.display)
-    : String(ev.line || '').replace(/ \\| /g, '|');
+    : String(ev.line || '').replace(/ \| /g, '|');
   // Exact UDP lines only — 1/2/3 as sent (no empty top pad → leading "|").
   const parts = payload.split('|').filter((r, i, a) =>
     r.length > 0 || (i > 0 && i < a.length - 1));

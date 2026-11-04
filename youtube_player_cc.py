@@ -55,8 +55,14 @@ READ_JS = r"""
       if (segs.length) break;
     }
   }
-  const lines = segs.map(el => (el.innerText || el.textContent || '')
-    .replace(/\s+/g, ' ').trim()).filter(Boolean);
+  const lines = [];
+  for (const el of segs) {
+    const raw = (el.innerText || el.textContent || '').replace(/\r/g, '');
+    for (const piece of raw.split(/\n+/)) {
+      const ln = piece.replace(/\s+/g, ' ').trim();
+      if (ln) lines.push(ln);
+    }
+  }
   const uniq = [];
   for (const ln of lines) {
     if (!uniq.length || uniq[uniq.length - 1] !== ln) uniq.push(ln);
@@ -203,6 +209,35 @@ def paint_lines(
     return painted
 
 
+def paint_windows(
+    lines, *, width, rows, uppercase, single_upper: bool = False
+) -> list[list[str]]:
+    """
+    Like paint_lines but never drops text: when a cue wraps to more than
+    `rows` lines it becomes several consecutive windows, in order.
+    """
+    width = max(8, min(32, int(width)))
+    rows = max(2, min(4, int(rows)))
+    if single_upper:
+        one = paint_lines(
+            lines, width=width, rows=rows, uppercase=uppercase, single_upper=True
+        )
+        return [one] if one else []
+    parts: list[str] = []
+    for ln in lines:
+        raw = ln.upper() if uppercase else ln
+        raw = ascii608(raw)
+        if raw:
+            parts.append(raw)
+    painted: list[str] = []
+    for p in parts:
+        if len(p) <= width:
+            painted.append(p)
+        else:
+            painted.extend(wrap_words(p, width))
+    return [painted[i : i + rows] for i in range(0, len(painted), rows)]
+
+
 def emit_painted(
     sock,
     addr,
@@ -272,7 +307,7 @@ def main() -> int:
     ap.add_argument("--host", default=str(demo.get("host") or "127.0.0.1"))
     ap.add_argument("--port", type=int, default=int(demo.get("port") or 54001))
     ap.add_argument("--rows", type=int, default=int(cap.get("rows") or 2))
-    ap.add_argument("--width", type=int, default=int(cap.get("width") or 32))
+    ap.add_argument("--width", type=int, default=int(cap.get("width") if cap.get("width") is not None else 31))
     ap.add_argument("--poll", type=float, default=0.25)
     ap.add_argument("--headed", action="store_true", help="Show the browser window")
     ap.add_argument("--no-upper", action="store_true")
@@ -305,8 +340,9 @@ def main() -> int:
         "width": width,
         "single_upper": single_upper,
         "timeout_ms": int(cap.get("timeout_ms") or 12000),
-        "font": int(cap.get("font") or 4),
-        "pen_size": str(cap.get("pen_size") or "large"),
+        # font 0 is valid ("default") — `or` would turn it into 4
+        "font": int(cap["font"]) if cap.get("font") is not None else 0,
+        "pen_size": str(cap.get("pen_size") or "standard"),
         "color": str(cap.get("color") or "yellow"),
         "cc": str(cap.get("cc") or "both"),
         "every": poll,
@@ -414,8 +450,24 @@ def main() -> int:
             tx_pending: list[str] = []
             last_queued_key = ""
             min_dwell = 0.40  # show each cue long enough to read
-            clear_gap = 0.18  # blank after CLEAR so EDM/DER can latch before next text
-            max_queue = 24
+            clear_gap = 0.18
+            queue_warn = 48
+
+            def cue_hold_seconds(prev: list[str], nxt: list[str], backlog: int) -> float:
+                prev_n = sum(1 for x in prev if str(x).strip())
+                nxt_n = sum(1 for x in nxt if str(x).strip())
+                nchars = sum(len(x) for x in prev) + sum(len(x) for x in nxt)
+                hold = min_dwell
+                if prev_n >= 2 or nxt_n >= 2:
+                    hold = max(hold, 0.50)
+                hold = max(hold, clear_gap + nchars / 55.0)
+                if backlog > 12:
+                    hold = max(hold, 0.40)
+                elif backlog > 4:
+                    hold = max(hold, 0.35)
+                return min(hold, 1.1)
+
+            tx_phase_clear_gap = clear_gap
 
             def recover_player(reason: str) -> None:
                 print(f"[yt-eye] recover: {reason}", file=sys.stderr)
@@ -504,24 +556,26 @@ def main() -> int:
 
                     # Queue every new stable overlay — never skip intermediate cues.
                     if stable_hits >= stable_need and key != last_queued_key:
-                        painted = paint_lines(
+                        windows = paint_windows(
                             pending_lines,
                             width=width,
                             rows=rows,
                             uppercase=uppercase,
                             single_upper=single_upper,
                         )
-                        if painted:
+                        if windows:
                             last_queued_key = key
                             last_key = key
-                            last_lines = list(painted)
+                            last_lines = list(windows[-1])
                             last_change = now
                             print(f"[yt-eye] see: {pending_lines!r}", file=sys.stderr)
-                            tx_queue.append(painted)
-                            while len(tx_queue) > max_queue:
-                                dropped = tx_queue.popleft()
+                            # Never drop: every window goes on air in order. Under a
+                            # deep backlog we only shorten the dwell (below).
+                            for w in windows:
+                                tx_queue.append(w)
+                            if len(tx_queue) >= queue_warn:
                                 print(
-                                    f"[yt-eye] queue full — drop oldest {dropped!r}",
+                                    f"[yt-eye] queue depth {len(tx_queue)} (draining, no drop)",
                                     file=sys.stderr,
                                 )
                     elif key == last_key:
@@ -547,6 +601,10 @@ def main() -> int:
                             f"paused={info.get('paused')} empty={empty_polls})",
                             file=sys.stderr,
                         )
+                    if empty_polls >= 8 and not info.get("cc"):
+                        recover_player("captions off (cc=False)")
+                        empty_polls = 0
+                        seen_since = now
                     gap = now - seen_since
                     if (
                         gap >= hold_limit
@@ -574,13 +632,20 @@ def main() -> int:
                         empty_polls = 0
 
                 # Drain queue: CLEAR previous → brief blank → next line(s).
-                if tx_phase == "idle" and tx_queue and (now - last_udp_hold) >= min_dwell:
+                # Deep backlog (fast speech): shorten dwell instead of dropping cues.
+                backlog = len(tx_queue)
+                if tx_phase == "idle" and tx_queue and (now - last_udp_hold) >= cue_hold_seconds(
+                    last_lines, tx_queue[0], backlog
+                ):
                     tx_pending = tx_queue.popleft()
                     send_udp(sock, addr, "CLEAR")
                     hub.publish("CLEAR", "", history=False)
                     tx_phase = "clearing"
                     tx_phase_at = now
-                elif tx_phase == "clearing" and (now - tx_phase_at) >= clear_gap:
+                    nchars = sum(len(x) for x in (last_lines or []))
+                    nchars += sum(len(x) for x in tx_pending)
+                    tx_phase_clear_gap = min(0.55, clear_gap + nchars / 55.0)
+                elif tx_phase == "clearing" and (now - tx_phase_at) >= tx_phase_clear_gap:
                     emit_painted(
                         sock,
                         addr,

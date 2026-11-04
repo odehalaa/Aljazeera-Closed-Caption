@@ -1,6 +1,6 @@
 # Al Jazeera Closed Caption (CEA-608 / CEA-708 → MPEG-TS)
 
-**Version 1.0**
+**Version 1.0.1**
 
 Live closed-caption injector for MPEG-TS H.264. Plain-text captions arrive over UDP and are embedded as **CEA-608 (CC1)** and/or **CEA-708 (DTVCC Service 1)** inside **A/53 GA94 SEI** on the video bitstream. Video and audio are **bitstream-copied** (no re-encode).
 
@@ -140,7 +140,7 @@ Edit `localaddr` to match your NIC before production use.
 |-----|---------|---------|-------------|
 | `rows` | 2, 3, 4 | `3` | Max roll-up window. Senders normally use 1–2 lines; 3rd only if needed. |
 | `row` | 1..15 | `13` | Base PAC row (15 = bottom). Window grows **upward**. |
-| `width` | 8..32 | `32` | Max ASCII chars per line (CEA-608 hard limit 32). |
+| `width` | 8..32 | `31` | Max ASCII chars per line. The 608 row has 32 cells but the colour mid-row code uses one, so **31** is the real printable width — `32` silently drops the last letter on TVs. |
 | `timeout_ms` | ≥0 | `12000` | Auto-CLEAR after idle ms (`0` = never). |
 | `color` | white green blue cyan red yellow magenta | `yellow` | Foreground. |
 | `cc` | `608` / `708` / `both` | `both` | `608` = universal CC1; `708` adds font/size; `both` recommended. |
@@ -375,7 +375,10 @@ ASCII only (`0x20`–`0x7E`). Max **32** characters per painted line.
 |---------|-----|
 | No CC in VLC | Enable **CC1**; use injector **output** URL; try `--bootstrap=1` |
 | Leftover characters after CLEAR | Raise `clear_frames` (6–8); ensure CLEAR finishes before next text (current code does) |
-| Truncated last letters (`offering`→`offer`) | SEI queue must drain; use current `cc_injector` (do not wipe undrained queue) |
+| Truncated last letters (`offering`→`offer`) | Fixed in v1.0.1: UDP events are applied in order **after** the previous SEI queue drains, and CC is muxed only on anchor (non-B) frames so TVs see chunks in display order |
+| Last letter of a full-width line missing | Use `width: 31` (default since v1.0.1) — the colour code occupies the 32nd cell |
+| Whole cues missing when sent fast (`nc` bursts, HTTP) | Fixed in v1.0.1: no more “latest datagram wins”; every datagram is queued FIFO |
+| Fast speech lags behind | Expected: nothing is dropped anymore; the eye shortens dwell under backlog and catches up |
 | Web ≠ YouTube text | Prefer `./youtube_eye` (overlay) over WebVTT; snap LIVE badge |
 | Multicast not received | Set `localaddr=` to correct NIC; check IGMP / firewall |
 | Font ignored | `--cc=608` has no font; use `--cc=both` and `--font=0` |
@@ -418,5 +421,12 @@ MIT — see [LICENSE](LICENSE).
 ---
 
 ## Release
+
+**v1.0.1** — Validation fixes from live TV and web monitor testing:
+
+- **Injector:** FIFO caption UDP (no “latest datagram wins”); defer new paint/CLEAR until the SEI queue drains; B-frame-safe SEI on forward PTS carriers; pop-on two-line 608 for `|` payloads; resume preamble for long paints; skip 708 on multi-line when `cc=both` (STB line-2 glyph issues); larger caption UDP receive buffer; default printable **width 31** (colour uses the 32nd cell).
+- **YouTube eye:** `paint_windows` without dropping queued rows; segment newline handling; hold/backlog tuning; recover when overlay CC is off; width/font defaults aligned with config.
+- **Web monitor:** read-only UI (YouTube-only send path).
+- **Ops:** `start.sh` / `stop.sh` to run injector + eye from config.
 
 **v1.0** — Live CEA-608/708 MPEG-TS injector with JSON config, demo/web monitor, YouTube eye ingest, strong CLEAR, and dual 608+708 output.

@@ -32,9 +32,9 @@
       "_allowed": "1..15"
     },
     "width": {
-      "_description": "Max characters per line. CEA-608 hard limit is 32 (YouTube-compatible broadcast width). Longer YouTube overlay lines are word-wrapped to this width (full words kept, not mid-word cut).",
-      "value": 32,
-      "_allowed": "8..32"
+      "_description": "Max characters per line. CEA-608 row is 32 cells but the colour mid-row code occupies one cell, so 31 is the real printable width (32 drops the last letter on TVs/ffmpeg). Longer YouTube overlay lines are word-wrapped to this width (full words kept, not mid-word cut).",
+      "value": 31,
+      "_allowed": "8..31 (32 only for white text with no colour code)"
     },
     "timeout_ms": {
       "_description": "Auto-CLEAR idle timeout in milliseconds. After the last caption is sent, wait this long with no new text then erase captions. 0 = never auto-clear.",

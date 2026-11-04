@@ -4,6 +4,7 @@
 
 #include <iostream>
 #include <vector>
+#include <deque>
 #include <string>
 #include <cstring>
 #include <algorithm>
@@ -274,6 +275,38 @@ static std::string strip_inline_style(const std::string& line, RollUpStyle& st)
 
 struct RollUpState { bool started=false; int lines=2; };
 
+// CC drain resume (stateless SEI decoders + split at row DER boundaries).
+static uint8_t g_cc_resume_row = 15;
+static RollUpStyle g_cc_resume_style{};
+
+static bool triplet_at_pair(const std::vector<uint8_t>& q, size_t off, uint8_t a, uint8_t b)
+{
+    if (off + 3 > q.size()) return false;
+    if (q[off] != 0xFC && q[off] != 0xFD) return false;
+    return (q[off + 1] & 0x7F) == a && (q[off + 2] & 0x7F) == b;
+}
+
+static bool triplet_at_is_printable_text(const std::vector<uint8_t>& q, size_t off)
+{
+    if (off + 3 > q.size()) return false;
+    if (q[off] != 0xFC && q[off] != 0xFD) return false;
+    const uint8_t a = q[off + 1] & 0x7F;
+    const uint8_t b = q[off + 2] & 0x7F;
+    return a >= 0x20 && a <= 0x7E && b >= 0x20 && b <= 0x7E;
+}
+
+static size_t align_cc_take_to_row_end(const std::vector<uint8_t>& q, size_t take)
+{
+    if (take >= q.size() || take < 3) return take;
+    take -= take % 3;
+    size_t best = 0;
+    for (size_t i = 0; i + 3 <= take; i += 3) {
+        if (triplet_at_pair(q, i, 0x14, 0x24))
+            best = i + 3;
+    }
+    return best >= 3 ? best : take;
+}
+
 static void push_style_attrs(std::vector<uint8_t>& out, const RollUpStyle& st)
 {
     if (st.bg_color == -2) {
@@ -281,6 +314,15 @@ static void push_style_attrs(std::vector<uint8_t>& out, const RollUpStyle& st)
         push_pair(out, 0x17, 0x2D); // BT transparent
     }
     push_midrow_style(out, st);
+}
+
+static void build_608_row_resume_preamble(std::vector<uint8_t>& out, uint8_t row,
+                                            const RollUpStyle& style)
+{
+    uint8_t p1 = 0, p2 = 0;
+    build_pac_for_row(row, p1, p2, style.underline, 0, 0);
+    push_pair(out, p1, p2);
+    push_style_attrs(out, style);
 }
 
 // Roll-up with CR (roll) + PAC + style + text
@@ -364,6 +406,9 @@ static void build_ru_live_tv(std::vector<uint8_t>& out, RollUpState& st,
     int nwin = st.lines;
     if (nwin < 2) nwin = 2;
     if (nwin > 4) nwin = 4;
+    const int ncontent = (int)next.size();
+    if (ncontent >= 2 && ncontent < nwin)
+        nwin = ncontent;
 
     auto take_window = [&](const std::vector<std::string>& src) {
         std::vector<std::string> w((size_t)nwin);
@@ -379,32 +424,41 @@ static void build_ru_live_tv(std::vector<uint8_t>& out, RollUpState& st,
 
     auto paint_row = [&](uint8_t row, const std::string& line, int /*prev_len*/) {
         uint8_t p1=0,p2=0;
-        build_pac_for_row(row, p1, p2, style.underline,
-                          style.italics ? 7 : (uint8_t)(style.color > 6 ? 0 : style.color),
-                          style.indent);
-        push_pair(out, p1, p2);
+        auto pac_col0 = [&]() {
+            build_pac_for_row(row, p1, p2, style.underline, 0, 0);
+            push_pair(out, p1, p2);
+        };
+        pac_col0();
+        push_pair(out, 0x14, 0x24);
+        pac_col0();
         if (!line.empty()) {
             push_style_attrs(out, style);
             push_text(out, line);
         }
-        // DER clears the rest of the row. Do NOT space-pad to 32 — VLC shows
-        // those pads as a long empty caption bar.
         push_pair(out, 0x14, 0x24);
+        g_cc_resume_row = row;
+        g_cc_resume_style = style;
     };
 
     if (!st.started) {
-        // No EDM here — erase flashes the whole caption area on many TVs.
-        push_pair(out, 0x14, ru_midrow_cmd(st.lines));
+        push_pair(out, 0x14, ru_midrow_cmd(nwin));
         st.started = true;
     }
     (void)allow_edm;
 
-    // Repaint rows that have text or need clearing. Skip empty→empty to save
-    // A/53 triplets (max 31/SEI) so 3-line captions still fit across packets.
+    int visible_lines = 0;
+    for (int i = 0; i < nwin; ++i)
+        if (!cur[(size_t)i].empty()) ++visible_lines;
+    const bool full_window = visible_lines >= 2;
+
     const bool first = prev.empty();
     for (int i = 0; i < nwin; ++i) {
         const bool same = (!first && cur[(size_t)i] == old[(size_t)i]);
-        if (same) continue;
+        if (!full_window) {
+            if (same) continue;
+        } else if (same && cur[(size_t)i].empty() && old[(size_t)i].empty()) {
+            continue;
+        }
         if (cur[(size_t)i].empty() && old[(size_t)i].empty()) continue;
         int row = (int)base_row - (nwin - 1 - i);
         if (row < 1) row = 1;
@@ -475,6 +529,38 @@ static void build_popon_cc(std::vector<uint8_t>& out, const std::string& line)
     uint8_t p1=0,p2=0; if (build_pac_for_row(15,p1,p2)) push_pair(out,p1,p2);
     push_text(out, line);
     push_pair(out, 0x14, 0x2F); // EOC
+}
+
+// Two-line pop-on: both rows in non-display memory, one EOC (TV-safe).
+static void build_popon_window(std::vector<uint8_t>& out, const std::vector<std::string>& lines,
+                               uint8_t base_row, const RollUpStyle& style, int max_rows)
+{
+    out.clear();
+    if (lines.empty()) return;
+    if (max_rows < 1) max_rows = 1;
+    if (max_rows > 4) max_rows = 4;
+    int n = (int)lines.size();
+    if (n > max_rows) n = max_rows;
+    const size_t first = lines.size() - (size_t)n;
+    push_pair(out, 0x14, 0x20);
+    push_pair(out, 0x14, 0x2E);
+    for (int i = 0; i < n; ++i) {
+        int row = (int)base_row - (n - 1 - i);
+        if (row < 1) row = 1;
+        if (row > 15) row = 15;
+        const std::string line = lines[first + (size_t)i].substr(0, 32);
+        uint8_t p1 = 0, p2 = 0;
+        build_pac_for_row((uint8_t)row, p1, p2, style.underline, 0, 0);
+        push_pair(out, p1, p2);
+        if (!line.empty()) {
+            push_style_attrs(out, style);
+            push_text(out, line);
+        }
+        push_pair(out, 0x14, 0x24);
+        g_cc_resume_row = (uint8_t)row;
+        g_cc_resume_style = style;
+    }
+    push_pair(out, 0x14, 0x2F);
 }
 
 // ======================================================================================
@@ -692,6 +778,7 @@ static void trim_cc_to_complete_dtvcc(std::vector<uint8_t>& cc, size_t max_bytes
 // Merge 608 + 708 into one cc_data list (cap 31 triplets).
 // Priority: complete 608 first (Enter/clear need many pairs). Then pack as many
 // complete DTVCC packets as fit — never truncate 708 mid-packet.
+[[maybe_unused]]
 static void merge_608_708(std::vector<uint8_t>& out, const std::vector<uint8_t>& cc608,
                           const std::vector<uint8_t>& cc708, int mode)
 {
@@ -856,6 +943,10 @@ static bool open_udp_listener(CaptionInput& ci, const std::string& host, uint16_
     if (inet_aton(h.c_str(), &addr.sin_addr) == 0) { close(ci.fd); ci.fd=-1; return false; }
 
     if (bind(ci.fd, (sockaddr*)&addr, sizeof(addr)) != 0) { close(ci.fd); ci.fd=-1; return false; }
+    {
+        int rcv = 256 * 1024;
+        setsockopt(ci.fd, SOL_SOCKET, SO_RCVBUF, (const char*)&rcv, sizeof(rcv));
+    }
     if (!set_nonblock(ci.fd)) { close(ci.fd); ci.fd=-1; return false; }
 
     ci.host = h; ci.port = port; ci.enabled = true;
@@ -877,8 +968,77 @@ static inline void trim_inplace(std::string& s) {
     ltrim_inplace(s); rtrim_inplace(s);
 }
 
-// Drain UDP. Multiple lines in one datagram (\\n or |) become multi-row caption.
-// CLEAR / clear / empty packet → out_clear=true.
+// One caption UDP event, kept in arrival order (never coalesced to "latest").
+struct CapUdpEvt {
+    bool is_clear = false;
+    std::string line; // "row1|row2" (empty when is_clear)
+};
+
+// Drain every pending datagram into `pending` IN ORDER. Several datagrams that
+// land inside one video frame used to collapse to the last one — whole cues
+// vanished (e.g. CLEAR + text in the same 20 ms → the text was never painted).
+static void udp_drain_events(int fd, std::deque<CapUdpEvt>& pending, bool quiet = false) {
+    if (fd < 0) return;
+    char buf[4096];
+    for (;;) {
+        sockaddr_in src{}; socklen_t slen = sizeof(src);
+        ssize_t n = recvfrom(fd, buf, sizeof(buf) - 1, 0, (sockaddr*)&src, &slen);
+        if (n < 0) break;
+        buf[n] = '\0';
+        std::string s(buf, (size_t)n);
+        for (char& ch : s) if (ch == '\r') ch = '\n';
+
+        std::vector<std::string> lines;
+        size_t start = 0;
+        while (true) {
+            size_t pos = s.find('\n', start);
+            std::string seg = (pos == std::string::npos) ? s.substr(start) : s.substr(start, pos - start);
+            std::string tmp;
+            tmp.reserve(seg.size());
+            for (char c : seg) {
+                unsigned char uc = (unsigned char)c;
+                if (uc >= 0x20 && uc <= 0x7E) tmp.push_back((char)uc);
+                else if (uc == '\t') tmp.push_back(' ');
+                if (tmp.size() >= 256) break;
+            }
+            trim_inplace(tmp);
+            if (!tmp.empty()) lines.push_back(tmp);
+            if (pos == std::string::npos) break;
+            start = pos + 1;
+        }
+
+        if (lines.empty()) {
+            pending.push_back(CapUdpEvt{true, ""});
+            if (!quiet) std::cerr << "[cc] recv: CLEAR (empty)\n";
+            continue;
+        }
+        if (lines.size() == 1) {
+            std::string up = lines[0];
+            for (char& c : up) c = (char)std::toupper((unsigned char)c);
+            if (up == "CLEAR" || up == "CLS" || up == "*CLEAR*") {
+                pending.push_back(CapUdpEvt{true, ""});
+                if (!quiet) std::cerr << "[cc] recv: CLEAR\n";
+                continue;
+            }
+        }
+        std::string out_line;
+        for (size_t i = 0; i < lines.size(); ++i) {
+            if (i) out_line.push_back('|');
+            out_line += lines[i];
+            if (out_line.size() >= 256) break;
+        }
+        pending.push_back(CapUdpEvt{false, out_line});
+        if (!quiet) {
+            int rows = 1;
+            for (char c : out_line) if (c == '|') ++rows;
+            std::cerr << "[cc] recv: \"" << out_line << "\" (" << rows << " rows)\n";
+        }
+    }
+}
+
+// Legacy "latest wins" reader — kept for reference / tools; the main loop uses
+// udp_drain_events so no datagram is ever dropped.
+[[maybe_unused]]
 static bool udp_get_latest_line_and_log(int fd, std::string& out_line, bool& out_clear, bool quiet = false) {
     if (fd < 0) return false;
     bool got = false;
@@ -1002,6 +1162,7 @@ static bool parse_int_arg(const char* s, const char* key, int& val) {
 // Audio layout helpers (FFmpeg version-guarded)
 // ======================================================================================
 
+[[maybe_unused]]
 static void set_audio_layout_from_decoder(AVCodecContext* aencCtx, const AVCodecContext* adecCtx) {
 #if LIBAVCODEC_VERSION_MAJOR >= 59
     if (adecCtx->ch_layout.nb_channels > 0) {
@@ -1433,6 +1594,13 @@ int main(int argc, char** argv)
     // A/53 allows ≤31 cc triplets per SEI. Multi-row paints often exceed that —
     // queue and drain across video packets so VLC gets complete captions.
     std::vector<uint8_t> cc_tx_queue;
+    std::deque<CapUdpEvt> cap_udp_pending;        // ordered caption events (FIFO)
+    // H.264 B-frames arrive in decode order but decoders present CC in DISPLAY
+    // order. A caption split over consecutive packets therefore arrives scrambled
+    // on TVs (tail chunk shown before its head → "offering" ends as "offer").
+    // Carry CC only on frames whose PTS is >= every PTS seen so far (I/P anchors).
+    int64_t cc_carrier_pts = AV_NOPTS_VALUE;
+    std::deque<std::vector<std::string>> pending_windows; // extra rows of a long "a|b|c|d" payload
     int live_paint_len = 0;
     int live_line_count = 0;
     std::vector<std::string> current_lines; // full window for live multi-line (Enter)
@@ -1452,30 +1620,76 @@ int main(int argc, char** argv)
             int64_t pts = (ipkt->pts != AV_NOPTS_VALUE) ? ipkt->pts :
                           (ipkt->dts != AV_NOPTS_VALUE) ? ipkt->dts : AV_NOPTS_VALUE;
 
-            // Poll UDP
+            // Is this packet a safe CC carrier (display order == decode order)?
+            bool cc_carrier = true;
+            if (pts != AV_NOPTS_VALUE) {
+                if (cc_carrier_pts != AV_NOPTS_VALUE) {
+                    if (pts + ms_to_tb(10000) < cc_carrier_pts)
+                        cc_carrier_pts = AV_NOPTS_VALUE;      // PTS wrap/discontinuity → resync
+                    else if (pts < cc_carrier_pts)
+                        cc_carrier = false;                   // B-frame: shown before an earlier carrier
+                }
+                if (cc_carrier) cc_carrier_pts = pts;
+            }
+
+            // Poll UDP — append every datagram in order (no "latest only" coalesce).
             if (use_external_udp_captions && caprx.enabled) {
-                std::string latest;
-                bool want_clear = false;
-                if (udp_get_latest_line_and_log(caprx.fd, latest, want_clear, quiet)) {
+                udp_drain_events(caprx.fd, cap_udp_pending, quiet);
+            }
+
+            // Apply ONE caption event per video frame, and only once the previous
+            // paint fully left the SEI queue. This is what keeps word endings:
+            // a CLEAR or new text that used to arrive mid-drain wiped the tail
+            // ("offering" → "offer", "the" → "th").
+            const bool cc_idle = cc_tx_queue.empty() && !clear_pending && clear_frames_left == 0;
+            if (cc_idle && !caption_pending && pending_lines.empty() && !pending_windows.empty()) {
+                // Next window of an over-long explicit payload ("a|b|c|d" with rows=2).
+                current_lines = pending_windows.front();
+                pending_windows.pop_front();
+                current_caption = current_lines.back();
+                caption_pending = true;
+                last_caption = join_caption_lines(current_lines);
+                last_caption_expire_pts = (pts == AV_NOPTS_VALUE) ? ms_to_tb(linger_ms)
+                                        : pts + ms_to_tb(linger_ms);
+                auto_clear_sent = (linger_ms <= 0);
+            } else if (use_external_udp_captions && caprx.enabled && cc_idle &&
+                       !cap_udp_pending.empty()) {
+                const CapUdpEvt ev = cap_udp_pending.front();
+                cap_udp_pending.pop_front();
+                if (!quiet && cap_udp_pending.size() > 16 && (cc_log % 60) == 0)
+                    std::cerr << "[cc] udp pending=" << cap_udp_pending.size() << " (ordered)\n";
+                {
+                    const std::string& latest = ev.line;
+                    const bool want_clear = ev.is_clear;
                     if (want_clear) {
                         clear_pending = true;
                         caption_pending = false;
                         pending_lines.clear();
+                        pending_windows.clear();
                         current_caption.clear();
                         current_lines.clear();
                         live_prev_lines.clear();
                     } else if (!latest.empty()) {
                         const bool explicit_window = (latest.find('|') != std::string::npos);
-                        // '|': live window (last N rows). Plain text: wrap ALL lines, then roll.
-                        std::vector<std::string> got = explicit_window
-                            ? split_caption_lines(latest, ru_lines, max_cols)
-                            : split_caption_lines(latest, /*max_lines=*/0, max_cols);
+                        // '|': explicit window rows. Plain text: wrap ALL lines, then roll.
+                        std::vector<std::string> got = split_caption_lines(latest, /*max_lines=*/0, max_cols);
                         if (!got.empty()) {
                             current_style = default_style;
                             for (auto& ln : got)
                                 ln = strip_inline_style(ln, current_style);
                             if (explicit_window) {
-                                // Multi-line (Enter / "|"): paint whole window at once
+                                // Multi-line (Enter / "|"): paint whole window at once.
+                                // More rows than the window holds → queue the rest as
+                                // further windows instead of dropping the first rows.
+                                pending_windows.clear();
+                                if ((int)got.size() > ru_lines) {
+                                    for (size_t i = (size_t)ru_lines; i < got.size(); i += (size_t)ru_lines) {
+                                        size_t e = std::min(got.size(), i + (size_t)ru_lines);
+                                        pending_windows.emplace_back(got.begin() + (std::ptrdiff_t)i,
+                                                                     got.begin() + (std::ptrdiff_t)e);
+                                    }
+                                    got.resize((size_t)ru_lines);
+                                }
                                 current_lines = got;
                                 pending_lines.clear();
                                 // Never store '|' in current_caption — that string may be painted
@@ -1509,7 +1723,9 @@ int main(int argc, char** argv)
                 }
             }
 
-            if (!caption_pending && !pending_lines.empty() && (frame_count % line_gap) == 0) {
+            // Roll the next wrapped line only after the previous one fully drained.
+            if (!caption_pending && !pending_lines.empty() && cc_tx_queue.empty() &&
+                (frame_count % line_gap) == 0) {
                 current_caption = pending_lines.front();
                 pending_lines.erase(pending_lines.begin());
                 current_style = default_style;
@@ -1555,7 +1771,8 @@ int main(int argc, char** argv)
                         std::cerr << "[cc] CLEAR start (repeat " << clear_frames_left << " pkts)\n";
                 }
                 do_clear = true; do_inject = true;
-                if (clear_frames_left > 0) --clear_frames_left;
+                // Count only packets that really carry the erase (anchor frames).
+                if (clear_frames_left > 0 && cc_carrier) --clear_frames_left;
                 prev_caption.clear(); curr_caption.clear(); current_caption.clear();
                 current_lines.clear();
                 live_prev_lines.clear();
@@ -1567,6 +1784,10 @@ int main(int argc, char** argv)
                 live_line_count = 0;
                 auto_clear_sent = true;
                 caption_pending = false;
+            } else if (caption_pending && (!current_caption.empty() || !current_lines.empty()) &&
+                       !cc_tx_queue.empty()) {
+                // Previous SEI chunks still draining — paint on a later frame so the
+                // tail of the previous caption reaches the decoder first.
             } else if (caption_pending && (!current_caption.empty() || !current_lines.empty())) {
                 caption_pending = false;
                 auto_clear_sent = (linger_ms <= 0);
@@ -1628,8 +1849,10 @@ int main(int argc, char** argv)
                     if (do_overwrite) {
                         if (current_lines.size() > 1) {
                             if (cc_mode & CC_MODE_608)
-                                build_ru_live_tv(cc608, ru_state, live_prev_lines, current_lines,
-                                                 (uint8_t)base_row, current_style, live_paint_len, true);
+                                build_popon_window(cc608, current_lines, (uint8_t)base_row,
+                                                   current_style, ru_lines);
+                            ru_state.started = false;
+                            live_paint_len = (int)current_lines.back().size();
                             live_prev_lines = current_lines;
                             live_line_count = (int)current_lines.size();
                             lines708 = current_lines;
@@ -1653,12 +1876,14 @@ int main(int argc, char** argv)
                         pen708.color608 = current_style.color;
                         pen708.underline = current_style.underline;
                         pen708.italics = current_style.italics;
-                        build_708_caption_cc(cc708, lines708, pen708, false);
+                        if (lines708.size() <= 1 || cc_mode == CC_MODE_708)
+                            build_708_caption_cc(cc708, lines708, pen708, false);
                     }
                 } else {
                     if (cc_mode & CC_MODE_608) build_popon_cc(cc608, current_caption);
                     if (cc_mode & CC_MODE_708) build_708_caption_cc(cc708, {current_caption}, pen708, false);
                 }
+                (void)do_repaint; (void)live_line_count;
                 // Prefer complete 608 then 708 in a queue (drained ≤31 triplets/SEI).
                 // Never replace the queue with an empty rebuild — that dropped the
                 // undrained tail (last syllables missing in VLC).
@@ -1694,20 +1919,36 @@ int main(int argc, char** argv)
                 ++cc_log;
             }
 
-            // Drain CC queue into this packet (A/53 max 31 triplets).
-            if (!cc_tx_queue.empty()) {
+            // Drain CC queue into this packet (A/53 max 31 triplets) — anchors only.
+            if (cc_carrier && !cc_tx_queue.empty()) {
                 const size_t maxb = 31 * 3;
-                size_t take = std::min(maxb, cc_tx_queue.size());
-                take -= take % 3;
-                if (take > 0) {
-                    cc.assign(cc_tx_queue.begin(), cc_tx_queue.begin() + (std::ptrdiff_t)take);
-                    cc_tx_queue.erase(cc_tx_queue.begin(), cc_tx_queue.begin() + (std::ptrdiff_t)take);
-                    cc_changed = true;
-                    if (!quiet && (cc_log < 8 || !cc_tx_queue.empty()))
-                        std::cerr << "[cc] inject len=" << cc.size()
-                                  << " remain=" << cc_tx_queue.size() << "\n";
+                cc.clear();
+                if (triplet_at_is_printable_text(cc_tx_queue, 0))
+                    build_608_row_resume_preamble(cc, g_cc_resume_row, g_cc_resume_style);
+                size_t room = maxb;
+                if (cc.size() >= room)
+                    room = 0;
+                else {
+                    room -= cc.size();
+                    room -= room % 3;
                 }
-            } else if (!do_inject && !linger_cc.empty() && (frame_count % cc_every) == 0 &&
+                if (room >= 3) {
+                    size_t take = std::min(room, cc_tx_queue.size());
+                    take -= take % 3;
+                    if (take < cc_tx_queue.size())
+                        take = align_cc_take_to_row_end(cc_tx_queue, take);
+                    if (take > 0) {
+                        cc.insert(cc.end(), cc_tx_queue.begin(),
+                                  cc_tx_queue.begin() + (std::ptrdiff_t)take);
+                        cc_tx_queue.erase(cc_tx_queue.begin(),
+                                          cc_tx_queue.begin() + (std::ptrdiff_t)take);
+                        cc_changed = true;
+                        if (!quiet && (cc_log < 8 || !cc_tx_queue.empty()))
+                            std::cerr << "[cc] inject len=" << cc.size()
+                                      << " remain=" << cc_tx_queue.size() << "\n";
+                    }
+                }
+            } else if (cc_carrier && !do_inject && !linger_cc.empty() && (frame_count % cc_every) == 0 &&
                        pts != AV_NOPTS_VALUE && last_caption_expire_pts != AV_NOPTS_VALUE &&
                        pts < last_caption_expire_pts) {
                 // Hold last CC; sei_every throttles identical re-inserts
@@ -1715,7 +1956,7 @@ int main(int argc, char** argv)
             }
 
             AVPacket* outpkt = nullptr;
-            const bool should_sei = !cc.empty() &&
+            const bool should_sei = cc_carrier && !cc.empty() &&
                 (cc_changed || do_clear || (sei_every <= 1) || ((frame_count % sei_every) == 0));
             if (should_sei) outpkt = packet_with_a53_sei(ipkt, cc);
             if (!outpkt) outpkt = av_packet_clone(ipkt);
