@@ -32,14 +32,20 @@ if [[ ! -f "$CONFIG" ]]; then
 fi
 
 json_get() { python3 "$ROOT/cc_config.py" "$CONFIG" --env "$1"; }
+cfg_val() { python3 "$ROOT/cc_config.py" "$CONFIG" "$1" 2>/dev/null || true; }
 
 IN="$(json_get IN)"
 OUT="$(json_get OUT)"
 ROWS="$(json_get ROWS)"
 ROW="$(json_get ROW)"
 WEB_PORT="$(json_get DEMO_WEB_PORT)"
-YT_URL="${YT_URL:-$(json_get YT_URL)}"
-POLL="${YT_POLL:-$(json_get YT_POLL)}"
+YT_URL="${YT_URL:-$(cfg_val youtube.url)}"
+POLL="${YT_POLL:-$(cfg_val youtube.poll_sec_direct)}"
+POLL="${POLL:-0.25}"
+if [[ -z "$YT_URL" ]]; then
+  echo "[start] youtube.url missing in $CONFIG" >&2
+  exit 1
+fi
 
 INJECTOR_LOG="${INJECTOR_LOG:-/tmp/cc_injector.log}"
 EYE_LOG="${EYE_LOG:-/tmp/youtube_eye.log}"
