@@ -219,6 +219,17 @@ def _pack_row_windows(groups: list[list[str]], rows: int) -> list[list[str]]:
     return windows
 
 
+def caption_grows(prev_key: str, new_key: str) -> bool:
+    """True when YouTube is extending the same on-screen cue (word-by-word)."""
+    if not prev_key or new_key == prev_key:
+        return False
+    if new_key.startswith(prev_key):
+        return True
+    prev0 = prev_key.split("|", 1)[0]
+    new0 = new_key.split("|", 1)[0]
+    return new0.startswith(prev0) and len(new_key) >= len(prev_key)
+
+
 def paint_lines(
     lines, *, width, rows, uppercase, single_upper: bool = False
 ) -> list[str]:
@@ -397,7 +408,7 @@ def main() -> int:
         "rows": rows,
         "width": width,
         "single_upper": single_upper,
-        "timeout_ms": int(cap.get("timeout_ms") or 12000),
+        "timeout_ms": int(cap.get("timeout_ms") or 8000),
         # font 0 is valid ("default") — `or` would turn it into 4
         "font": int(cap["font"]) if cap.get("font") is not None else 0,
         "pen_size": str(cap.get("pen_size") or "standard"),
@@ -428,7 +439,7 @@ def main() -> int:
     print(f"[yt-eye] opening player: {args.url}", file=sys.stderr)
     print(
         f"[yt-eye] → udp://{args.host}:{args.port} rows={rows} width={width} "
-        f"single_upper={single_upper} poll={poll}s",
+        f"single_upper={single_upper} poll={poll}s idle_clear={int(cap.get('timeout_ms') or 8000)}ms",
         file=sys.stderr,
     )
 
@@ -487,45 +498,50 @@ def main() -> int:
                 time.sleep(1.0)
 
             print("[yt-eye] reading on-screen lines — Ctrl+C to stop", file=sys.stderr)
-            seen_since = time.time()  # last time overlay had real text
-            last_change = time.time()  # last time caption text changed
+            idle_clear_ms = int(cap.get("timeout_ms") or 8000)
+            idle_clear_sec = max(0.0, idle_clear_ms / 1000.0)
+            seen_since = time.time()
+            last_change = time.time()
+            last_caption_udp_at = time.time()
             last_udp_hold = 0.0
             last_snap = 0.0
             last_reenable = 0.0
             empty_polls = 0
             last_lines: list[str] = []
-            hold_limit = 5.0  # only bridge short gaps; don't freeze forever
-            # Capture every distinct overlay (no skip). Debounce half-frame
-            # glitches with 2 identical reads, then queue so fast speech is
-            # sent line-by-line. CLEAR previous before each new payload.
             pending_key = ""
             pending_lines: list[str] = []
             stable_hits = 0
             stable_need = 2
             tx_queue: deque[list[str]] = deque()
-            tx_phase = "idle"  # idle | clearing | showing
-            tx_phase_at = 0.0
-            tx_pending: list[str] = []
             last_queued_key = ""
-            min_dwell = 0.40  # show each cue long enough to read
-            clear_gap = 0.18
+            min_dwell = 0.12
             queue_warn = 48
+            cleared_idle = False
+            video_id = args.url.rstrip("/").split("v=")[-1].split("&")[0][:16]
+            last_text_at = time.time()
 
-            def cue_hold_seconds(prev: list[str], nxt: list[str], backlog: int) -> float:
-                prev_n = sum(1 for x in prev if str(x).strip())
-                nxt_n = sum(1 for x in nxt if str(x).strip())
-                nchars = sum(len(x) for x in prev) + sum(len(x) for x in nxt)
-                hold = min_dwell
-                if prev_n >= 2 or nxt_n >= 2:
-                    hold = max(hold, 0.50)
-                hold = max(hold, clear_gap + nchars / 55.0)
-                if backlog > 12:
-                    hold = max(hold, 0.40)
-                elif backlog > 4:
-                    hold = max(hold, 0.35)
-                return min(hold, 1.1)
+            def idle_clear_now(now: float) -> bool:
+                if idle_clear_sec <= 0 or not last_lines or cleared_idle:
+                    return False
+                return (now - last_text_at) >= idle_clear_sec
 
-            tx_phase_clear_gap = clear_gap
+            def do_idle_clear(now: float) -> None:
+                nonlocal last_lines, last_key, last_queued_key, cleared_idle
+                nonlocal last_caption_udp_at, tx_queue, pending_key, stable_hits
+                print(
+                    f"[yt-eye] idle clear ({idle_clear_sec:.0f}s no overlay text)",
+                    file=sys.stderr,
+                )
+                send_udp(sock, addr, "CLEAR")
+                hub.publish("CLEAR", "", history=True)
+                last_lines = []
+                last_key = ""
+                last_queued_key = ""
+                pending_key = ""
+                stable_hits = 0
+                tx_queue.clear()
+                cleared_idle = True
+                last_caption_udp_at = now
 
             def recover_player(reason: str) -> None:
                 print(f"[yt-eye] recover: {reason}", file=sys.stderr)
@@ -580,7 +596,7 @@ def main() -> int:
                     continue
                 if not isinstance(info, dict):
                     info = {"lines": info if isinstance(info, list) else []}
-                if info.get("href") and "gCNeDWCI0vo" not in str(info.get("href")):
+                if info.get("href") and video_id and video_id not in str(info.get("href")):
                     print(
                         f"[yt-eye] WARN wrong url {info.get('href')} — reloading target",
                         file=sys.stderr,
@@ -604,6 +620,8 @@ def main() -> int:
                 if lines:
                     empty_polls = 0
                     seen_since = now
+                    last_text_at = now
+                    cleared_idle = False
                     key = "|".join(lines)
                     if key == pending_key:
                         stable_hits += 1
@@ -612,7 +630,6 @@ def main() -> int:
                         pending_lines = list(lines)
                         stable_hits = 1
 
-                    # Queue every new stable overlay — never skip intermediate cues.
                     if stable_hits >= stable_need and key != last_queued_key:
                         windows = paint_windows(
                             pending_lines,
@@ -622,26 +639,46 @@ def main() -> int:
                             single_upper=single_upper,
                         )
                         if windows:
+                            growing = caption_grows(last_queued_key, key)
+                            if growing:
+                                had_q = len(tx_queue)
+                                if tx_queue:
+                                    tx_queue.pop()
+                                tx_queue.extend(windows)
+                                print(
+                                    f"[yt-eye] grow: {pending_lines!r}",
+                                    file=sys.stderr,
+                                )
+                                if had_q == 0:
+                                    emit_painted(
+                                        sock,
+                                        addr,
+                                        windows[-1],
+                                        on_send,
+                                        publish=True,
+                                        history=False,
+                                    )
+                                    last_caption_udp_at = now
+                                    last_udp_hold = now
+                            else:
+                                print(
+                                    f"[yt-eye] see: {pending_lines!r}",
+                                    file=sys.stderr,
+                                )
+                                for w in windows:
+                                    tx_queue.append(w)
+                                if len(tx_queue) >= queue_warn:
+                                    print(
+                                        f"[yt-eye] queue depth {len(tx_queue)} "
+                                        f"(draining, no drop)",
+                                        file=sys.stderr,
+                                    )
                             last_queued_key = key
                             last_key = key
                             last_lines = list(windows[-1])
                             last_change = now
-                            print(f"[yt-eye] see: {pending_lines!r}", file=sys.stderr)
-                            # Never drop: every window goes on air in order. Under a
-                            # deep backlog we only shorten the dwell (below).
-                            for w in windows:
-                                tx_queue.append(w)
-                            if len(tx_queue) >= queue_warn:
-                                print(
-                                    f"[yt-eye] queue depth {len(tx_queue)} (draining, no drop)",
-                                    file=sys.stderr,
-                                )
                     elif key == last_key:
-                        if (
-                            (now - last_change) >= 12.0
-                            and not tx_queue
-                            and tx_phase == "idle"
-                        ):
+                        if (now - last_change) >= 12.0 and not tx_queue:
                             recover_player(f"same caption {now - last_change:.0f}s")
                             last_change = now
                             last_key = ""
@@ -663,19 +700,8 @@ def main() -> int:
                         recover_player("captions off (cc=False)")
                         empty_polls = 0
                         seen_since = now
-                    gap = now - seen_since
-                    if (
-                        gap >= hold_limit
-                        and last_lines
-                        and not tx_queue
-                        and tx_phase == "idle"
-                    ):
-                        print("[yt-eye] gap > hold — CLEAR stale caption", file=sys.stderr)
-                        send_udp(sock, addr, "CLEAR")
-                        hub.publish("CLEAR", "", history=True)
-                        last_lines = []
-                        last_key = ""
-                        last_queued_key = ""
+                    if idle_clear_now(now):
+                        do_idle_clear(now)
                     if (now - last_reenable) >= 1.5:
                         try:
                             st = page.evaluate(ENABLE_CC_JS)
@@ -684,54 +710,27 @@ def main() -> int:
                         except Exception as e:
                             print(f"[yt-eye] re-enable fail: {e}", file=sys.stderr)
                         last_reenable = now
+                    gap = now - seen_since
                     if gap >= 15.0:
                         recover_player(f"overlay empty {gap:.0f}s")
                         seen_since = now
                         empty_polls = 0
 
-                # Drain queue: CLEAR previous → brief blank → next line(s).
-                # Deep backlog (fast speech): shorten dwell instead of dropping cues.
-                backlog = len(tx_queue)
-                if tx_phase == "idle" and tx_queue and (now - last_udp_hold) >= cue_hold_seconds(
-                    last_lines, tx_queue[0], backlog
-                ):
-                    tx_pending = tx_queue.popleft()
-                    send_udp(sock, addr, "CLEAR")
-                    hub.publish("CLEAR", "", history=False)
-                    tx_phase = "clearing"
-                    tx_phase_at = now
-                    nchars = sum(len(x) for x in (last_lines or []))
-                    nchars += sum(len(x) for x in tx_pending)
-                    tx_phase_clear_gap = min(0.55, clear_gap + nchars / 55.0)
-                elif tx_phase == "clearing" and (now - tx_phase_at) >= tx_phase_clear_gap:
+                # Next caption overwrites the previous — no CLEAR flash between cues.
+                if tx_queue and (now - last_udp_hold) >= min_dwell:
+                    w = tx_queue.popleft()
                     emit_painted(
                         sock,
                         addr,
-                        tx_pending,
+                        w,
                         on_send,
                         publish=True,
                         history=True,
                     )
+                    last_caption_udp_at = now
                     last_udp_hold = now
-                    last_lines = list(tx_pending)
-                    tx_pending = []
-                    tx_phase = "idle"
-                elif (
-                    tx_phase == "idle"
-                    and not tx_queue
-                    and last_lines
-                    and (now - last_udp_hold) >= 3.0
-                    and (now - last_change) < hold_limit
-                ):
-                    emit_painted(
-                        sock,
-                        addr,
-                        last_lines,
-                        on_send,
-                        publish=True,
-                        history=False,
-                    )
-                    last_udp_hold = now
+                    last_lines = list(w)
+                    cleared_idle = False
 
                 time.sleep(poll)
     except KeyboardInterrupt:

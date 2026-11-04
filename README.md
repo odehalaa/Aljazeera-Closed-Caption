@@ -62,7 +62,7 @@ Typical use: take a live multicast/unicast TS, inject captions from a demo feed,
 - **`cc_injector`** — core encoder path: read TS, inject SEI, write TS.
 - **`config.json` + `cc_config.py`** — documented JSON; CLI/env override.
 - **`demo.py` / `./demo`** — RSS/JSON/text → UDP + optional web UI.
-- **`youtube_player_cc.py` / `./youtube_eye`** — Playwright scrapes YouTube **on-screen** `.ytp-caption-segment` (what eyes see), queues line-by-line, CLEAR between cues.
+- **`youtube_player_cc.py` / `./youtube_eye`** — Playwright scrapes YouTube **on-screen** overlay lines; new text **replaces** the previous caption (no flash CLEAR). Sends **CLEAR** only after `timeout_ms` with no overlay text (default **8000** ms).
 - **`youtube_live_cc.py` / `./youtube_cc`** — alternate path via yt-dlp WebVTT (can differ from player overlay).
 - **`live_type.py`** — keyboard typing into captions.
 - **`caption_http.py`** — HTTP → UDP bridge.
@@ -141,7 +141,7 @@ Edit `localaddr` to match your NIC before production use.
 | `rows` | 2, 3, 4 | `3` | Max roll-up window. Senders normally use 1–2 lines; 3rd only if needed. |
 | `row` | 1..15 | `13` | Base PAC row (15 = bottom). Window grows **upward**. |
 | `width` | 8..32 | `31` | Max ASCII chars per line. The 608 row has 32 cells but the colour mid-row code uses one, so **31** is the real printable width — `32` silently drops the last letter on TVs. |
-| `timeout_ms` | ≥0 | `12000` | Auto-CLEAR after idle ms (`0` = never). |
+| `timeout_ms` | ≥0 | `8000` | Auto-CLEAR after idle ms with **no on-screen caption text** (`0` = never). Injector uses the same value.
 | `color` | white green blue cyan red yellow magenta | `yellow` | Foreground. |
 | `cc` | `608` / `708` / `both` | `both` | `608` = universal CC1; `708` adds font/size; `both` recommended. |
 | `font` | 0..7 | `0` | CEA-708 only. **0 = default** (most compatible). 1 mono, 2 prop, 3 mono_sans, 4 casual, 5 cursive, 6 small_caps, 7 prop_sans. |
@@ -271,7 +271,8 @@ Behaviour:
 - Snaps to YouTube **LIVE** badge.
 - Preserves YouTube line breaks (wraps only if &gt; 32 chars).
 - Queues cues so fast speech is not skipped.
-- Sends **CLEAR** before each new cue so previous glyphs do not linger.
+- New cues **overwrite** the previous caption on the injector (no blank gap between lines).
+- Sends **CLEAR** only when the YouTube overlay has been empty for `captions.timeout_ms` (default 8 seconds).
 
 ---
 

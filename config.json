@@ -38,7 +38,7 @@
     },
     "timeout_ms": {
       "_description": "Auto-CLEAR idle timeout in milliseconds. After the last caption is sent, wait this long with no new text then erase captions. 0 = never auto-clear.",
-      "value": 12000,
+      "value": 8000,
       "_allowed": "0 = off, typical 3000..10000"
     },
     "color": {
