@@ -43,24 +43,39 @@ except ImportError:
 
 READ_JS = r"""
 () => {
-  const roots = [
-    ...document.querySelectorAll('.ytp-caption-window-container'),
-    ...document.querySelectorAll('#caption-window-1'),
-    ...document.querySelectorAll('.caption-window'),
-  ];
-  let segs = Array.from(document.querySelectorAll('.ytp-caption-segment'));
-  if (!segs.length) {
-    for (const root of roots) {
-      segs = Array.from(root.querySelectorAll('.ytp-caption-segment, span'));
-      if (segs.length) break;
-    }
-  }
+  const cont = document.querySelector('.ytp-caption-window-container')
+    || document.querySelector('#caption-window-1');
+  const win = document.querySelector('.ytp-caption-window-bottom')
+    || document.querySelector('.ytp-caption-window')
+    || (cont && cont.querySelector('.caption-window'))
+    || cont;
   const lines = [];
-  for (const el of segs) {
-    const raw = (el.innerText || el.textContent || '').replace(/\r/g, '');
+  if (win) {
+    const raw = (win.innerText || win.textContent || '').replace(/\r/g, '');
     for (const piece of raw.split(/\n+/)) {
       const ln = piece.replace(/\s+/g, ' ').trim();
       if (ln) lines.push(ln);
+    }
+  }
+  if (!lines.length) {
+    let segs = cont
+      ? Array.from(cont.querySelectorAll('.ytp-caption-segment'))
+      : Array.from(document.querySelectorAll('.ytp-caption-segment'));
+    if (segs.length) {
+      const rows = new Map();
+      for (const el of segs) {
+        const rect = el.getBoundingClientRect();
+        if (rect.width <= 0 && rect.height <= 0) continue;
+        const key = Math.round(rect.top / 10) * 10;
+        const t = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
+        if (!t) continue;
+        if (!rows.has(key)) rows.set(key, []);
+        rows.get(key).push(t);
+      }
+      for (const top of [...rows.keys()].sort((a, b) => a - b)) {
+        const ln = rows.get(top).join(' ').replace(/\s+/g, ' ').trim();
+        if (ln) lines.push(ln);
+      }
     }
   }
   const uniq = [];
@@ -166,6 +181,44 @@ async () => {
 """
 
 
+def _overlay_groups(parts: list[str], width: int) -> list[list[str]]:
+    """One group per YouTube on-screen row; word-wrap only single-line cues."""
+    width = max(8, min(32, int(width)))
+    if len(parts) >= 2:
+        return [[p] for p in parts]
+    painted: list[str] = []
+    for p in parts:
+        if len(p) <= width:
+            painted.append(p)
+        else:
+            painted.extend(wrap_words(p, width))
+    return [painted] if painted else []
+
+
+def _pack_row_windows(groups: list[list[str]], rows: int) -> list[list[str]]:
+    """Pack wrapped groups into consecutive on-air windows (max `rows` each)."""
+    rows = max(2, min(4, int(rows)))
+    windows: list[list[str]] = []
+    current: list[str] = []
+    for group in groups:
+        chunk = list(group)
+        while chunk:
+            space = rows - len(current)
+            if space <= 0:
+                windows.append(current)
+                current = []
+                space = rows
+            take = min(space, len(chunk))
+            current.extend(chunk[:take])
+            chunk = chunk[take:]
+            if len(current) >= rows:
+                windows.append(current)
+                current = []
+    if current:
+        windows.append(current)
+    return windows
+
+
 def paint_lines(
     lines, *, width, rows, uppercase, single_upper: bool = False
 ) -> list[str]:
@@ -198,6 +251,11 @@ def paint_lines(
         return out
 
     # Preserve YouTube line breaks — do not join/reflow the whole cue.
+    if len(parts) >= 2:
+        painted = list(parts)
+        if len(painted) > rows:
+            painted = painted[-rows:]
+        return painted
     painted: list[str] = []
     for p in parts:
         if len(p) <= width:
@@ -229,12 +287,12 @@ def paint_windows(
         raw = ascii608(raw)
         if raw:
             parts.append(raw)
-    painted: list[str] = []
-    for p in parts:
-        if len(p) <= width:
-            painted.append(p)
-        else:
-            painted.extend(wrap_words(p, width))
+    groups = _overlay_groups(parts, width)
+    if not groups:
+        return []
+    if len(parts) >= 2:
+        return _pack_row_windows(groups, rows)
+    painted = groups[0]
     return [painted[i : i + rows] for i in range(0, len(painted), rows)]
 
 
